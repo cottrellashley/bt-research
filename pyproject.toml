@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nautilus-fi"
-version = "0.3.0"
+version = "0.4.0"
 description = "Fixed income backtesting platform on Nautilus Trader v2: point-in-time data, marks vs fills, dated settlement, ledger of record, funding, structured deals, manifests"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"

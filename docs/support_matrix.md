@@ -4,8 +4,8 @@ Generated from `nautilus_fi.support.default_support_matrix()`; every run's manif
 
 | Status | Meaning | Count |
 | --- | --- | --- |
-| VALIDATED | mechanics covered by a fixture or invariant test named in the row | 33 |
-| SUPPORTED_WITH_APPROXIMATION | runs, with the simplification stated in the row | 28 |
+| VALIDATED | mechanics covered by a fixture or invariant test named in the row | 43 |
+| SUPPORTED_WITH_APPROXIMATION | runs, with the simplification stated in the row | 31 |
 | EXPERIMENTAL | code path exists, not validated end to end | 2 |
 | UNSUPPORTED | refused by the builder | 5 |
 
@@ -38,6 +38,19 @@ Generated from `nautilus_fi.support.default_support_matrix()`; every run's manif
 | GOVERNANCE | trial_ledger | VALIDATED |  | every run recorded; DSR uses the ledger's trial variance; PBO over the variant matrix; holdout guard |
 | GOVERNANCE | walk_forward | VALIDATED |  | purge and embargo in trading days; validation and out-of-sample trials recorded |
 | IRS | valuation_margin | SUPPORTED_WITH_APPROXIMATION | single-curve fallback when no projection curve; flat forwards per period; tradable on the margin venue as a financed contract on a supplied price (NPV) series | par swap values to zero; VM/CTM postings |
+| KERNEL | construction_methods | VALIDATED |  | vectorised and per-date paths give identical returns; caps, projections and checks |
+| KERNEL | cost_models | SUPPORTED_WITH_APPROXIMATION | half spread, fixed, square-root impact and expression costs with default parameters until calibrated on own TCA; the optimiser sees the linear part | cost algebra; impact rises with size; participation spreads trades over days |
+| KERNEL | custom_code | SUPPORTED_WITH_APPROXIMATION | custom functions are checked empirically on three truncated panels, not proven causal; closures over external data are not seen | causal custom code passes; full-sample demeaning refused |
+| KERNEL | data_seam | VALIDATED |  | frame / callable / composite / mapped / SQL / field-store sources; memory-mapped cache slices; pinned snapshot versions; as-of reads |
+| KERNEL | explain | VALIDATED |  | net difference = holdings + cash and financing + costs + residual; identical results flagged; binding constraints reported |
+| KERNEL | expressions | VALIDATED |  | z-score / rank / demean by group, rolling and differences equal pandas references; neutralised residual orthogonal to the exposure |
+| KERNEL | implement_fidelity | SUPPORTED_WITH_APPROXIMATION | needs an event-engine environment (terms, evaluated prices) from the source or supplied; execution parameters as in the execution process row | the same strategy runs solvent in the event engine with the paper statistics' keys; reconciliation decomposes the gap |
+| KERNEL | index_expressions | VALIDATED |  | constituents reproduce the published index return; exclusions and issuer caps hold at every reconstitution |
+| KERNEL | lookahead_checks | VALIDATED |  | leads refused structurally; full-sample code caught on truncated panels; availability lags cannot be undercut |
+| KERNEL | optimiser_expressions | VALIDATED |  | issuer, sector, exposure, weight and turnover limits hold at every rebalance; custom linear constraints bind; penalties need negative coefficients |
+| KERNEL | sessions_and_sweeps | VALIDATED |  | one trial per strategy and window across restarts; concurrent ledger writers; parallel sweeps equal sequential; record gates |
+| KERNEL | strategy_identity | VALIDATED |  | fingerprint changes with custom code and parameters, not names; diff by component; path edits |
+| KERNEL | vectorised_engine | VALIDATED |  | identical returns to the panel engine for the same research spec; long-short financing; overlays; triggered schedules |
 | LINKER | indexation_uk_eur_ca | SUPPORTED_WITH_APPROXIMATION | lag/interpolation per convention; no seasonality |  |
 | LINKER | indexation_us_tips | VALIDATED |  | Canadian interpolation; known vs projected CPI; maturity floor |
 | LOAN | amendments | VALIDATED |  | effective vs announcement dated terms |

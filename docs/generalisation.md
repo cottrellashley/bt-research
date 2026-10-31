@@ -1,5 +1,11 @@
 # One platform for the six fixed income backtesting families
 
+> The research kernel ([kernel.md](kernel.md)) is now the front door: the same capabilities as
+> Python objects (data sources, expressions, indices, construction, optimiser terms and constraints,
+> mechanics) behind one `Strategy`, a vectorised engine that reproduces the Paper engine exactly,
+> Implement fidelity through the event engine, and sessions that count every trial. `ResearchSpec`
+> and the stages below remain, and `Strategy.from_spec` runs any of them in the kernel.
+
 The review of nautilus-fi against seventeen fixed income backtesting frameworks found a strong cash-bond
 implementation simulator (ledger, settlement, entitlement, funding, marks kept apart from fills) and
 gaps in everything the research families need: index and return-series assets, vendor analytics,

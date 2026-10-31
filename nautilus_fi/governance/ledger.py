@@ -7,6 +7,11 @@ From those the ledger gives the number of trials and the cross-trial variance of
 the deflated Sharpe ratio needs, and the aligned variant return matrix that PBO (CSCV) needs. The
 holdout guard of ``research.ExperimentRegistry`` applies: once a hypothesis's holdout has been seen,
 further runs over it are refused unless marked final.
+
+Several processes (research agents, parallel sweeps) can write one ledger at once: each trial is
+its own file written atomically (``trials/<time>-<id>.json``, returns ``returns/<id>.parquet``), and
+the hypothesis registry merges under a lock. Trials carry a ``session`` (a research thread), so
+selection statistics can be scoped to everything one thread tried.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,6 +49,8 @@ class Trial:
     note: str = ""
     created_utc: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     returns_file: str | None = None
+    session: str = ""
+    description: str = ""
 
 
 def _clean(v):
@@ -57,38 +65,49 @@ class TrialLedger:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         (self.root / "returns").mkdir(parents=True, exist_ok=True)
+        (self.root / "trials").mkdir(parents=True, exist_ok=True)
         self.registry = ExperimentRegistry(self.root / "hypotheses.json")
-        self.path = self.root / "trials.jsonl"
+        self.path = self.root / "trials.jsonl"                # legacy single-file ledgers are still read
 
     # ------------------------------------------------------------------ hypotheses
     def register(self, h: Hypothesis) -> Hypothesis:
         """Pre-register a hypothesis (its timestamp must precede every trial that cites it)."""
+        self.registry.reload()
         if h.hypothesis_id in self.registry.hypotheses:
             raise ValueError(f"hypothesis {h.hypothesis_id} already registered; register a new id for a changed hypothesis")
         return self.registry.register(h)
 
     def hypothesis(self, hypothesis_id: str) -> Hypothesis | None:
+        if hypothesis_id not in self.registry.hypotheses:
+            self.registry.reload()
         return self.registry.hypotheses.get(hypothesis_id)
 
     # ------------------------------------------------------------------ recording
-    def record(self, stage: str, name: str, spec_hash: str, variant: dict, period: tuple[str, str], summary: dict, returns: pd.Series | None = None, hypothesis_id: str | None = None, conventions: dict | None = None, uses_holdout: bool = False, status: str = "COMPLETED", note: str = "") -> Trial:
+    def record(self, stage: str, name: str, spec_hash: str, variant: dict, period: tuple[str, str], summary: dict, returns: pd.Series | None = None, hypothesis_id: str | None = None, conventions: dict | None = None, uses_holdout: bool = False, status: str = "COMPLETED", note: str = "", session: str = "", description: str = "") -> Trial:
         if stage not in STAGES:
             raise ValueError(f"unknown stage {stage!r}; use one of {STAGES}")
         if hypothesis_id is not None:
+            self.registry.reload()
             if hypothesis_id not in self.registry.hypotheses:
                 raise KeyError(f"hypothesis {hypothesis_id!r} is not registered: pre-register it before running trials")
             # holdout guard (raises HoldoutViolation)
             self.registry.record(ExperimentRecord(hypothesis_id, spec_hash, {k: _clean(v) for k, v in variant.items()}, period, {}, status, uses_holdout, note))
             uses_holdout = self.registry.records[-1].uses_holdout
-        payload = json.dumps([stage, name, spec_hash, variant, period, hypothesis_id, len(self.trials_list())], sort_keys=True, default=str)
+        payload = json.dumps([stage, name, spec_hash, variant, period, hypothesis_id, session, uuid.uuid4().hex], sort_keys=True, default=str)
         tid = hashlib.sha256(payload.encode()).hexdigest()[:16]
         rfile = None
         if returns is not None and len(returns):
+            from nautilus_fi.core.fileio import tmp_path
+
             rfile = f"returns/{tid}.parquet"
-            pd.DataFrame({"date": pd.to_datetime(returns.index), "ret": returns.to_numpy(dtype=float)}).to_parquet(self.root / rfile, index=False)
-        trial = Trial(tid, hypothesis_id, stage, name, spec_hash, {k: _clean(v) for k, v in variant.items()}, (str(period[0]), str(period[1])), {k: _clean(v) for k, v in summary.items() if isinstance(_clean(v), (int, float, str, bool, type(None)))}, conventions or {}, uses_holdout, status, note, returns_file=rfile)
-        with self.path.open("a") as f:
-            f.write(json.dumps(asdict(trial), default=str) + "\n")
+            tmp = tmp_path(self.root / rfile)
+            pd.DataFrame({"date": pd.to_datetime(returns.index), "ret": returns.to_numpy(dtype=float)}).to_parquet(tmp, index=False)
+            tmp.replace(self.root / rfile)
+        trial = Trial(tid, hypothesis_id, stage, name, spec_hash, {k: _clean(v) for k, v in variant.items()}, (str(period[0]), str(period[1])), {k: _clean(v) for k, v in summary.items() if isinstance(_clean(v), (int, float, str, bool, type(None)))}, conventions or {}, uses_holdout, status, note, returns_file=rfile, session=session, description=description)
+        from nautilus_fi.core.fileio import atomic_write_text
+
+        stamp = trial.created_utc.replace(":", "").replace("-", "").replace("+", "")
+        atomic_write_text(self.root / "trials" / f"{stamp}-{tid}.json", json.dumps(asdict(trial), default=str))
         return trial
 
     def record_result(self, result, spec=None, stage: str = "PAPER", uses_holdout: bool = False, hypothesis_id: str | None = None, note: str = "") -> Trial:
@@ -114,54 +133,65 @@ class TrialLedger:
 
     # ------------------------------------------------------------------ queries
     def trials_list(self) -> list[dict]:
-        if not self.path.exists():
-            return []
-        return [json.loads(line) for line in self.path.read_text().splitlines() if line.strip()]
+        rows = [json.loads(line) for line in self.path.read_text().splitlines() if line.strip()] if self.path.exists() else []
+        folder = self.root / "trials"
+        if folder.exists():
+            for f in sorted(folder.glob("*.json")):
+                try:
+                    rows.append(json.loads(f.read_text()))
+                except (json.JSONDecodeError, OSError):          # a file being replaced right now: skip it
+                    continue
+        rows.sort(key=lambda t: t.get("created_utc", ""))
+        return rows
 
-    def trials(self, hypothesis_id: str | None = None, stage: str | None = None) -> pd.DataFrame:
-        rows = [t for t in self.trials_list() if (hypothesis_id is None or t["hypothesis_id"] == hypothesis_id) and (stage is None or t["stage"] == stage)]
+    @staticmethod
+    def _match(t: dict, hypothesis_id: str | None, stages, session: str | None) -> bool:
+        return (hypothesis_id is None or t["hypothesis_id"] == hypothesis_id) and (stages is None or t["stage"] in stages) and (session is None or t.get("session", "") == session)
+
+    def trials(self, hypothesis_id: str | None = None, stage: str | None = None, session: str | None = None) -> pd.DataFrame:
+        rows = [t for t in self.trials_list() if self._match(t, hypothesis_id, None if stage is None else (stage,), session)]
         if not rows:
             return pd.DataFrame()
         flat = [{**{k: v for k, v in t.items() if k not in ("summary", "variant", "conventions")}, **{f"param.{k}": v for k, v in t["variant"].items()}, **{f"result.{k}": v for k, v in t["summary"].items()}} for t in rows]
         return pd.DataFrame(flat)
 
-    def n_trials(self, hypothesis_id: str, stages: tuple[str, ...] = ("PAPER", "IMPLEMENT", "VALIDATION")) -> int:
-        return sum(1 for t in self.trials_list() if t["hypothesis_id"] == hypothesis_id and t["stage"] in stages and not t["uses_holdout"])
+    def n_trials(self, hypothesis_id: str | None, stages: tuple[str, ...] = ("PAPER", "IMPLEMENT", "VALIDATION"), session: str | None = None) -> int:
+        return sum(1 for t in self.trials_list() if self._match(t, hypothesis_id, stages, session) and not t["uses_holdout"])
 
-    def trial_returns(self, hypothesis_id: str, stages: tuple[str, ...] = ("PAPER", "VALIDATION")) -> dict[str, pd.Series]:
+    def trial_returns(self, hypothesis_id: str | None, stages: tuple[str, ...] = ("PAPER", "VALIDATION"), session: str | None = None) -> dict[str, pd.Series]:
         out = {}
         for t in self.trials_list():
-            if t["hypothesis_id"] != hypothesis_id or t["stage"] not in stages or t["uses_holdout"] or not t.get("returns_file"):
+            if not self._match(t, hypothesis_id, stages, session) or t["uses_holdout"] or not t.get("returns_file"):
                 continue
             df = pd.read_parquet(self.root / t["returns_file"])
             out[t["trial_id"]] = pd.Series(df["ret"].to_numpy(), index=pd.to_datetime(df["date"]))
         return out
 
-    def returns_matrix(self, hypothesis_id: str, stages: tuple[str, ...] = ("PAPER", "VALIDATION")) -> pd.DataFrame:
+    def returns_matrix(self, hypothesis_id: str | None, stages: tuple[str, ...] = ("PAPER", "VALIDATION"), session: str | None = None) -> pd.DataFrame:
         """Trial returns aligned on their common dates (what PBO needs)."""
-        cols = self.trial_returns(hypothesis_id, stages)
+        cols = self.trial_returns(hypothesis_id, stages, session)
         return pd.DataFrame(cols).dropna() if cols else pd.DataFrame()
 
-    def sharpe_variance(self, hypothesis_id: str, stages: tuple[str, ...] = ("PAPER", "VALIDATION")) -> float | None:
+    def sharpe_variance(self, hypothesis_id: str | None, stages: tuple[str, ...] = ("PAPER", "VALIDATION"), session: str | None = None) -> float | None:
         """Cross-trial variance of per-period Sharpe ratios, each on its own dates (what the deflated
         Sharpe ratio needs; walk-forward validation windows do not overlap)."""
-        series = self.trial_returns(hypothesis_id, stages)
+        series = self.trial_returns(hypothesis_id, stages, session)
         sr = [float(r.mean() / r.std(ddof=1)) for r in series.values() if len(r) > 2 and r.std(ddof=1) > 0]
         if len(sr) < 2:
             return None
         return float(np.var(sr, ddof=1))
 
-    def deflated_sharpe(self, hypothesis_id: str, returns: pd.Series, periods_per_year: float = 252.0, stages: tuple[str, ...] = ("PAPER", "VALIDATION")) -> dict:
+    def deflated_sharpe(self, hypothesis_id: str | None, returns: pd.Series, periods_per_year: float = 252.0, stages: tuple[str, ...] = ("PAPER", "VALIDATION"), session: str | None = None) -> dict:
         r = pd.Series(returns).dropna()
-        n = max(self.n_trials(hypothesis_id, stages), 1)
-        var = self.sharpe_variance(hypothesis_id, stages)
+        n = max(self.n_trials(hypothesis_id, stages, session), 1)
+        var = self.sharpe_variance(hypothesis_id, stages, session)
         sr = float(r.mean() / r.std(ddof=1) * math.sqrt(periods_per_year)) if r.std(ddof=1) else float("nan")
         out = deflated_sharpe_ratio(sr, n, len(r), float(r.skew()), float(r.kurt() + 3.0), var, round(periods_per_year))
         out["ledger_trials"] = n
         return out
 
-    def pbo(self, hypothesis_id: str, n_splits: int = 8, stages: tuple[str, ...] = ("PAPER", "VALIDATION")) -> dict:
-        m = self.returns_matrix(hypothesis_id, stages)
+    def pbo(self, hypothesis_id: str | None, n_splits: int = 8, stages: tuple[str, ...] = ("PAPER", "VALIDATION"), session: str | None = None) -> dict:
+        m = self.returns_matrix(hypothesis_id, stages, session)
         if m.shape[1] < 2 or len(m) < n_splits * 4:
             return {"pbo": float("nan"), "n_trials": m.shape[1], "note": "needs at least two trials on common dates"}
         out = probability_of_backtest_overfitting(m.to_numpy(), n_splits=n_splits)
@@ -169,6 +199,7 @@ class TrialLedger:
         return out
 
     def holdout_viewed(self, hypothesis_id: str) -> bool:
+        self.registry.reload()
         return hypothesis_id in self.registry.holdout_viewed
 
 

@@ -82,11 +82,32 @@ class ExperimentRegistry:
         rows = [{"hypothesis": r.hypothesis_id, "config_hash": r.config_hash, "period": f"{r.period[0]}..{r.period[1]}", "status": r.status, "uses_holdout": r.uses_holdout, **{f"param.{k}": v for k, v in r.variant.items()}, **{f"result.{k}": v for k, v in r.summary.items()}} for r in self.records if hypothesis_id is None or r.hypothesis_id == hypothesis_id]
         return pd.DataFrame(rows)
 
+    def reload(self) -> None:
+        """Re-read the file (another process may have registered or recorded since)."""
+        if self.path and self.path.exists():
+            self.hypotheses, self.records, self.holdout_viewed = {}, [], set()
+            self._load()
+
     def _save(self) -> None:
+        """Merge with what is on disk, then replace the file atomically, under a lock: concurrent
+        writers never lose each other's hypotheses, records or holdout flags."""
         if not self.path:
             return
-        payload = {"hypotheses": {k: asdict(v) for k, v in self.hypotheses.items()}, "records": [asdict(r) for r in self.records], "holdout_viewed": sorted(self.holdout_viewed)}
-        self.path.write_text(json.dumps(payload, indent=2, default=str))
+        from nautilus_fi.core.fileio import atomic_write_text, file_lock
+
+        with file_lock(self.path.with_name(self.path.name + ".lock")):
+            if self.path.exists():
+                disk = ExperimentRegistry(None)
+                disk.path = self.path
+                disk._load()
+                for k, v in disk.hypotheses.items():
+                    self.hypotheses.setdefault(k, v)
+                seen = {_record_key(r) for r in self.records}
+                self.records = [r for r in disk.records if _record_key(r) not in seen] + self.records
+                self.records.sort(key=lambda r: r.created_utc)
+                self.holdout_viewed |= disk.holdout_viewed
+            payload = {"hypotheses": {k: asdict(v) for k, v in self.hypotheses.items()}, "records": [asdict(r) for r in self.records], "holdout_viewed": sorted(self.holdout_viewed)}
+            atomic_write_text(self.path, json.dumps(payload, indent=2, default=str))
 
     def _load(self) -> None:
         payload = json.loads(self.path.read_text())
@@ -97,6 +118,10 @@ class ExperimentRegistry:
             r["period"] = tuple(r["period"])
             self.records.append(ExperimentRecord(**r))
         self.holdout_viewed = set(payload.get("holdout_viewed", []))
+
+
+def _record_key(r: ExperimentRecord) -> tuple:
+    return (r.hypothesis_id, r.config_hash, r.created_utc, str(r.period), r.note)
 
 
 __all__ = ["ExperimentRecord", "ExperimentRegistry", "HoldoutViolation", "Hypothesis"]

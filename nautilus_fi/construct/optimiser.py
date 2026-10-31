@@ -68,9 +68,22 @@ class Objective:
     active_l1: float = 0.0
     risk: RiskModel | None = None
     cvar: CVaRTerm | None = None
+    anchor: pd.Series | None = None              # active_l1 measured against these weights instead of the benchmark
 
     def to_dict(self) -> dict:
         return {"alpha": self.alpha, "cost": self.cost, "tracking": None if self.tracking is None else {"fields": list(self.tracking.fields), "by": list(self.tracking.by), "weight": self.tracking.weight}, "active_l1": self.active_l1, "risk": None if self.risk is None else {"aversion": self.risk.aversion, "active": self.risk.active, "factors": list(self.risk.factor_cov.columns)}, "cvar": None if self.cvar is None else {"beta": self.cvar.beta, "weight": self.cvar.weight, "active": self.cvar.active}}
+
+
+@dataclass
+class LinearRow:
+    """A custom linear constraint ``lo <= coef . w <= hi`` (``coef`` aligned to the cross-section ids)."""
+
+    coef: np.ndarray
+    lo: float | None = None
+    hi: float | None = None
+    name: str = "linear"
+    hard: bool = True
+    penalty: float = 100.0
 
 
 @dataclass
@@ -218,7 +231,7 @@ class _Model:
         return status, x, duals, float(info.objective_function_value), float(getattr(info, "mip_gap", 0.0) or 0.0), A
 
 
-def optimise(cs: CrossSection, objective: Objective | None = None, constraints=None, long_only: bool = True, settings: OptimiserSettings | None = None) -> OptimisationResult:
+def optimise(cs: CrossSection, objective: Objective | None = None, constraints=None, long_only: bool = True, settings: OptimiserSettings | None = None, linear_rows: list[LinearRow] | None = None) -> OptimisationResult:
     """Solve the construction problem. Mixed-integer constraints (cardinality, minimum holdings) on
     large universes use ``lp_round``: solve the LP relaxation, shrink the candidate set by successive
     LPs until the cardinality bound can bind, fix binaries the LP already decides, and leave binaries
@@ -231,14 +244,15 @@ def optimise(cs: CrossSection, objective: Objective | None = None, constraints=N
         notes.append({"constraint": "turnover", "group": None, "reason": "initial build from cash: turnover limit not applied"})
     integer_kinds = [c for c in cons if c.kind in ("cardinality", "min_holding")]
     strategy = settings.mip_strategy if settings.mip_strategy != "auto" else ("lp_round" if len(cs.ids) > settings.mip_full_max_names else "full")
-    run = (lambda cc: _optimise_lp_round(cs, objective, cc, long_only, settings)) if integer_kinds and strategy == "lp_round" else (lambda cc: _optimise(cs, objective, cc, long_only, settings))
-    res = run(cons)
+    rows = list(linear_rows or [])
+    run = (lambda cc, lr: _optimise_lp_round(cs, objective, cc, long_only, settings, lr)) if integer_kinds and strategy == "lp_round" else (lambda cc, lr: _optimise(cs, objective, cc, long_only, settings, linear_rows=lr))
+    res = run(cons, rows)
     if not res.ok and settings.on_infeasible == "relax" and res.status in ("Infeasible", "Primal infeasible or unbounded"):
         from dataclasses import replace as _replace
 
         keep_hard = ("budget", "cash", "weight", "cardinality", "min_holding")
         soft = [c if (c.kind in keep_hard or not c.hard) else _replace(c, hard=False, penalty=settings.relax_penalty) for c in cons]
-        retry = run(soft)
+        retry = run(soft, [_replace(r, hard=False, penalty=settings.relax_penalty) for r in rows])
         if retry.ok:
             retry.relaxations = [{"constraint": "all limits", "group": None, "reason": f"hard problem {res.status}: limits other than budget / weight / integer made soft at penalty {settings.relax_penalty}"}, *retry.relaxations]
             retry.message = f"relaxed after {res.status}"
@@ -247,7 +261,7 @@ def optimise(cs: CrossSection, objective: Objective | None = None, constraints=N
     return res
 
 
-def _optimise_lp_round(cs: CrossSection, objective, cons: list[ConstraintSpec], long_only: bool, settings: OptimiserSettings) -> OptimisationResult:
+def _optimise_lp_round(cs: CrossSection, objective, cons: list[ConstraintSpec], long_only: bool, settings: OptimiserSettings, linear_rows: list[LinearRow] | None = None) -> OptimisationResult:
     """Large-universe heuristic for cardinality / minimum holdings: LP relaxation, successive LPs that
     force the smallest names out until the cardinality bound holds, then round each name held below
     its minimum up (at least half the minimum) or out, and re-solve the LP with those decisions fixed.
@@ -261,7 +275,7 @@ def _optimise_lp_round(cs: CrossSection, objective, cons: list[ConstraintSpec], 
     card = next((c for c in cons if c.kind == "cardinality" and c.max is not None), None)
     n = len(cs.ids)
     zero_mask = np.zeros(n, dtype=bool)
-    lp = _optimise(cs, objective, relaxed, long_only, full)
+    lp = _optimise(cs, objective, relaxed, long_only, full, linear_rows=linear_rows)
     if not lp.ok:
         return lp
     rounds = 0
@@ -272,7 +286,7 @@ def _optimise_lp_round(cs: CrossSection, objective, cons: list[ConstraintSpec], 
         order = held[np.argsort(-np.abs(w[held]), kind="stable")]
         zero_mask[:] = True
         zero_mask[order[:keep_n]] = False
-        lp = _optimise(cs, objective, relaxed, long_only, full, ub_override=np.where(zero_mask, 0.0, np.inf))
+        lp = _optimise(cs, objective, relaxed, long_only, full, ub_override=np.where(zero_mask, 0.0, np.inf), linear_rows=linear_rows)
         if not lp.ok:
             return lp
         w = lp.weights.reindex(cs.ids).fillna(0.0).to_numpy()
@@ -287,19 +301,19 @@ def _optimise_lp_round(cs: CrossSection, objective, cons: list[ConstraintSpec], 
     out = (frac & ~up) | ~held | zero_mask
     lb_o = np.where(held & ~out, mins, 0.0)
     ub_o = np.where(out, 0.0, np.inf)
-    res = _optimise(cs, objective, relaxed + ([ConstraintSpec("cardinality", card.min, card.max)] if card is not None and card.min is not None else []), long_only, full, lb_override=lb_o, ub_override=ub_o) if not (card is not None and card.min is not None) else None
+    res = _optimise(cs, objective, relaxed + ([ConstraintSpec("cardinality", card.min, card.max)] if card is not None and card.min is not None else []), long_only, full, lb_override=lb_o, ub_override=ub_o, linear_rows=linear_rows) if not (card is not None and card.min is not None) else None
     strategy = "lp_round"
     if res is None or not res.ok:
         strategy = "lp_round+milp"
         z_lo = np.where(held & ~frac & ~zero_mask, 1.0, 0.0)
         z_hi = np.where(zero_mask | ~held, 0.0, 1.0)
-        res = _optimise(cs, objective, cons, long_only, full, z_fix=(z_lo, z_hi))
+        res = _optimise(cs, objective, cons, long_only, full, z_fix=(z_lo, z_hi), linear_rows=linear_rows)
     res.problem.update({"mip_strategy": strategy, "elimination_rounds": rounds, "rounded_up": int(up.sum()), "rounded_out": int((frac & ~up).sum()), "fixed_out": int(out.sum())})
     res.solve_seconds = time.perf_counter() - t0
     return res
 
 
-def _optimise(cs: CrossSection, objective: Objective | None, cons: list[ConstraintSpec], long_only: bool, settings: OptimiserSettings, z_fix: tuple[np.ndarray, np.ndarray] | None = None, lb_override: np.ndarray | None = None, ub_override: np.ndarray | None = None) -> OptimisationResult:
+def _optimise(cs: CrossSection, objective: Objective | None, cons: list[ConstraintSpec], long_only: bool, settings: OptimiserSettings, z_fix: tuple[np.ndarray, np.ndarray] | None = None, lb_override: np.ndarray | None = None, ub_override: np.ndarray | None = None, linear_rows: list[LinearRow] | None = None) -> OptimisationResult:
     t0 = time.perf_counter()
     objective = objective or Objective()
     ids = cs.ids
@@ -419,6 +433,14 @@ def _optimise(cs: CrossSection, objective: Objective | None, cons: list[Constrai
         elif k == "cvar":
             _add_cvar(M, cs, b, s, w0, wb, n, c.beta, c.active, constraint=c)
 
+    for lr in linear_rows or ():
+        x = np.nan_to_num(np.asarray(lr.coef, dtype=float))
+        cols, vals = trade_coefs(x)
+        const = float(x @ w0)
+        row = M.add_row(cols, vals, -INF if lr.lo is None else lr.lo - const, INF if lr.hi is None else lr.hi - const, lr.name)
+        if not lr.hard:
+            M.soften(row, lr.penalty, lr.name)
+
     # ---------------------------------------------------------------- mixed-integer: cardinality and minimum holdings
     z = None
     if integer_needed:
@@ -465,7 +487,7 @@ def _optimise(cs: CrossSection, objective: Objective | None, cons: list[Constrai
     if objective.active_l1 > 0:
         a = M.add_vars(n, 0.0, INF, objective.active_l1)
         r = np.arange(n)
-        d = w0 - wb
+        d = w0 - (objective.anchor.reindex(ids).fillna(0.0).to_numpy(dtype=float) if objective.anchor is not None else wb)
         M.add_rows(np.concatenate([r, r, r]), np.concatenate([a, b, s]), np.concatenate([np.ones(n), -np.ones(n), np.ones(n)]), d, np.full(n, np.inf), [f"l1+:{i}" for i in ids])
         M.add_rows(np.concatenate([r, r, r]), np.concatenate([a, b, s]), np.concatenate([np.ones(n), np.ones(n), -np.ones(n)]), -d, np.full(n, np.inf), [f"l1-:{i}" for i in ids])
         l1_cols = a
@@ -563,4 +585,4 @@ def _variance(rm: RiskModel, ids, a: np.ndarray) -> float:
     return float(y @ F @ y + (spec * a * a).sum())
 
 
-__all__ = ["CVaRTerm", "Objective", "OptimisationError", "OptimisationResult", "OptimiserSettings", "RiskModel", "TrackingTerm", "optimise"]
+__all__ = ["CVaRTerm", "LinearRow", "Objective", "OptimisationError", "OptimisationResult", "OptimiserSettings", "RiskModel", "TrackingTerm", "optimise"]

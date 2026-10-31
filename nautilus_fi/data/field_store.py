@@ -93,16 +93,17 @@ class FieldStore:
             snaps = [(kt, p) for kt, p in snaps if kt <= cut]
         if not snaps:
             return pd.DataFrame(columns=["entity", "date", "value", "source", "knowledge_time"])
-        want = set(map(str, entities)) if entities is not None else None
+        want = sorted(set(map(str, entities))) if entities is not None else None
+        filters = []                                # pushed down into the Parquet scan (row groups skipped)
+        if start is not None:
+            filters.append(("date", ">=", pd.Timestamp(start)))
+        if end is not None:
+            filters.append(("date", "<=", pd.Timestamp(end)))
+        if want is not None:
+            filters.append(("entity", "in", want))
         frames = []
         for kt, p in snaps:
-            f = pq.read_table(p).to_pandas()
-            if start is not None:
-                f = f[f["date"] >= pd.Timestamp(start)]
-            if end is not None:
-                f = f[f["date"] <= pd.Timestamp(end)]
-            if want is not None:
-                f = f[f["entity"].isin(want)]
+            f = pq.read_table(p, filters=filters or None).to_pandas()
             if len(f):
                 f = f.assign(knowledge_time=kt)
                 frames.append(f)

@@ -30,6 +30,46 @@ Honest status per blueprint area is in [docs/blueprint_status.md](docs/blueprint
 product / feature support matrix is in [docs/support_matrix.md](docs/support_matrix.md). Every run
 carries the rows that apply to it.
 
+## The research kernel: strategies as Python objects
+
+The ground the platform works up from (`nautilus_fi.kernel`, re-exported as `import nautilus_fi as nfi`).
+Data sources, fields and signals, universes and indices, construction methods, the optimiser's terms
+and constraints, execution, costs, financing and conventions are all Python objects, and those objects
+decide what the engines do. It is built for a research agent working next to the company data platform
+that answers a PM's "if I change my strategy this way, how would it perform, and why?". See
+[docs/kernel.md](docs/kernel.md).
+
+```python
+import nautilus_fi as nfi
+
+nfi.session("~/research/ig-value", source=nfi.CallableSource(data_tool, fields))   # the agent's data tool
+base = nfi.Strategy("ig_value", universe=nfi.Index("LUACTRUU") & (nfi.Field("oasd") > 1),
+                    signal=nfi.Field("oas_bp").zscore(by="sector"),
+                    portfolio=nfi.Optimise(1e-3 * nfi.Alpha() - 2e-3 * nfi.TrackingError(by=["sector"]) - nfi.Costs(),
+                                           nfi.ActiveWeight("issuer") <= 0.005, nfi.Turnover() <= 0.10),
+                    benchmark=nfi.Index("LUACTRUU"), execution=nfi.NextClose(1, cost=nfi.HalfSpread() * 1.5))
+idea = base.with_(signal=base.signal.neutralise("oasd"), name="duration_neutral")
+print(nfi.compare(base, idea, window=("2015", "2024")).explain())   # what changed, how much, noise or not, where from
+nfi.sweep(base, {"portfolio.n": [50, 100]})                           # every variant counted for DSR / PBO
+nfi.run(idea, fidelity="implement")                                   # the same object through the event engine
+```
+
+| Layer | What it is | Module |
+| --- | --- | --- |
+| Data seam | `catalog()` + `load(request)`: panels, memory-mapped caches, bitemporal stores, SQL / Snowflake, an agent's fetch function, composites, identifier maps | `kernel.data` |
+| Expressions | point-in-time fields; time-series and per-date transforms vectorised over all dates and cached; look-ahead checked structurally and on truncated panels | `kernel.expr` |
+| Universe and benchmarks | `Index` as members and weights; excluded, capped, reweighted and blended derivatives | `kernel.benchmark` |
+| Construction | vectorised heuristics, projections onto constraints, and an optimiser written as `Alpha() - TrackingError() - Costs()` plus constraint objects | `kernel.portfolio` |
+| Mechanics | execution timing, cost algebra, participation, financing, missing returns, excess returns, turnover, metrics (the legacy profiles are presets) | `kernel.mechanics` |
+| Strategy | immutable; `with_`, `set(path)`, `diff`, `under(profile)`, a fingerprint that includes custom code, `describe`, `validate` | `kernel.strategy` |
+| Engines and results | Paper (vectorised) and Implement (event engine) with one result schema; `compare`, `explain`, `reconcile` | `kernel.engine`, `kernel.implement`, `kernel.result` |
+| Sessions | every run a deduplicated trial in a concurrency-safe ledger; result cache; sweeps in memory-mapped worker processes; DSR, PBO and the record gates | `kernel.session` |
+
+Daily rebalancing of a 3,000-bond universe over five years takes 0.9 s, against 32.9 s in the previous
+Paper engine. At 9,000 bonds over ten years, a monthly quintile takes 2.7 s, a daily one 4.2 s, and a
+monthly index-plus optimisation 18 s. The kernel reproduces the previous engine's returns for the same
+spec exactly.
+
 ## One research spec, four stages
 
 Beside the event engine sits a research platform that covers the six families of fixed income
@@ -78,7 +118,7 @@ python examples/family3_index_tracking.py      # custom capped benchmark + optim
 python examples/family4_overlays.py            # duration hedge, CDX, DTS-neutral pairs; margin venue book
 python examples/family5_implementation.py      # Paper vs Implement reconciliation, trade proposal files
 python examples/family6_governance.py          # pre-registration, trial ledger, DSR / PBO, official record
-pytest                                         # 141 tests, several minutes (event-engine runs dominate)
+pytest                                         # 172 tests, several minutes (event-engine runs dominate)
 ```
 
 A strategy is a `FixedIncomeStrategy` that sees the market only through its `DecisionContext`
@@ -239,6 +279,8 @@ nautilus_fi/
   reports/       bundle
   backtest/      environment, builder, strategy, spec_strategy, actor, context, result, scenarios
   synthetic/     generator (every product family, three structured deals), panels (index-scale universe)
+  kernel/        the research kernel: data seam, expressions, benchmarks, mechanics, construction and optimiser
+                 API, strategy, vectorised engine, results / explain, sessions and sweeps, implement adapter, agent API
   domain/        conventions, rebalance calendars, field definitions, research spec and decision API
   benchmarks/    published, custom, composite and return-series benchmarks
   construct/     cross-sections, signal transforms, constraint grammar, methods, optimiser (HiGHS)
@@ -248,10 +290,11 @@ nautilus_fi/
   propose/       trade proposals, OMS / PORT writers, reconciliation
   data/          ... plus panel, field_store, loaders/ (sql, snowflake, fiatlas, files)
   support.py     the declared support matrix
-examples/        fund_sleeves, strategies, run_fund_sleeves, run_carry_strategy, run_cost_scenarios, family1..6
-tests/           141 tests: the original 92 plus conventions / data, construction, paper / governance,
-                 the generalised event engine, proposals / loaders
-docs/            architecture, generalisation, data contracts, bias checklist, support matrix, blueprint status
+examples/        agent_workflow (the PM what-if loop), fund_sleeves, strategies, run_fund_sleeves, run_carry_strategy,
+                 run_cost_scenarios, family1..6
+tests/           172 tests: the original 92 plus conventions / data, construction, paper / governance,
+                 the generalised event engine, proposals / loaders, and the research kernel
+docs/            kernel, architecture, generalisation, data contracts, bias checklist, support matrix, blueprint status
 ```
 
 ## Known limits

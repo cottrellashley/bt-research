@@ -83,6 +83,20 @@ def default_support_matrix() -> SupportMatrix:
     decl(Capability("GOVERNANCE", "trial_ledger", V, ("*",), ("*",), run_modes=("*",), validation_case="every run recorded; DSR uses the ledger's trial variance; PBO over the variant matrix; holdout guard"))
     decl(Capability("GOVERNANCE", "walk_forward", V, ("*",), ("*",), run_modes=("*",), validation_case="purge and embargo in trading days; validation and out-of-sample trials recorded"))
     decl(Capability("GOVERNANCE", "official_records", V, ("*",), ("*",), run_modes=("*",), validation_case="gates refuse missing Implement / reconciliation / unconfirmed conventions; hash-chained registry"))
+    # the research kernel: strategies as Python objects on any data source
+    decl(Capability("KERNEL", "data_seam", V, ("*",), ("*",), run_modes=("*",), validation_case="frame / callable / composite / mapped / SQL / field-store sources; memory-mapped cache slices; pinned snapshot versions; as-of reads"))
+    decl(Capability("KERNEL", "expressions", V, ("*",), ("*",), run_modes=("*",), validation_case="z-score / rank / demean by group, rolling and differences equal pandas references; neutralised residual orthogonal to the exposure"))
+    decl(Capability("KERNEL", "lookahead_checks", V, ("*",), ("*",), run_modes=("*",), validation_case="leads refused structurally; full-sample code caught on truncated panels; availability lags cannot be undercut"))
+    decl(Capability("KERNEL", "custom_code", A, ("*",), ("*",), run_modes=("*",), approximation="custom functions are checked empirically on three truncated panels, not proven causal; closures over external data are not seen", validation_case="causal custom code passes; full-sample demeaning refused"))
+    decl(Capability("KERNEL", "index_expressions", V, ("*",), ("*",), run_modes=("*",), data_requirements=("index constituents",), validation_case="constituents reproduce the published index return; exclusions and issuer caps hold at every reconstitution"))
+    decl(Capability("KERNEL", "construction_methods", V, ("*",), ("*",), run_modes=("*",), validation_case="vectorised and per-date paths give identical returns; caps, projections and checks"))
+    decl(Capability("KERNEL", "optimiser_expressions", V, ("*",), ("*",), run_modes=("*",), model="HiGHS LP / MILP / QP", validation_case="issuer, sector, exposure, weight and turnover limits hold at every rebalance; custom linear constraints bind; penalties need negative coefficients"))
+    decl(Capability("KERNEL", "cost_models", A, ("*",), ("*",), run_modes=("*",), approximation="half spread, fixed, square-root impact and expression costs with default parameters until calibrated on own TCA; the optimiser sees the linear part", validation_case="cost algebra; impact rises with size; participation spreads trades over days"))
+    decl(Capability("KERNEL", "strategy_identity", V, ("*",), ("*",), run_modes=("*",), validation_case="fingerprint changes with custom code and parameters, not names; diff by component; path edits"))
+    decl(Capability("KERNEL", "vectorised_engine", V, ("*",), ("*",), run_modes=("*",), validation_case="identical returns to the panel engine for the same research spec; long-short financing; overlays; triggered schedules"))
+    decl(Capability("KERNEL", "explain", V, ("*",), ("*",), run_modes=("*",), validation_case="net difference = holdings + cash and financing + costs + residual; identical results flagged; binding constraints reported"))
+    decl(Capability("KERNEL", "implement_fidelity", A, ("*",), ("*",), approximation="needs an event-engine environment (terms, evaluated prices) from the source or supplied; execution parameters as in the execution process row", validation_case="the same strategy runs solvent in the event engine with the paper statistics' keys; reconciliation decomposes the gap"))
+    decl(Capability("KERNEL", "sessions_and_sweeps", V, ("*",), ("*",), run_modes=("*",), validation_case="one trial per strategy and window across restarts; concurrent ledger writers; parallel sweeps equal sequential; record gates"))
     return sm
 
 
