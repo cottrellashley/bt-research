@@ -1,4 +1,4 @@
-# nautilus-fi: a fixed income backtesting platform on Nautilus Trader v2
+# bt-research: a fixed income backtesting platform on Nautilus Trader v2
 
 `nautilus_fi` turns [Nautilus Trader](https://github.com/nautechsystems/nautilus_trader) (v2, Rust
 core + PyO3) into a research-grade paper-portfolio backtester for the whole fixed income universe:
