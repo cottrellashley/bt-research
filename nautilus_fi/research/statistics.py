@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,29 @@ def newey_west_sharpe_se(returns: pd.Series | np.ndarray, periods_per_year: int 
     sd = r.std(ddof=1)
     se_mean = math.sqrt(max(lr_var, 1e-18) / n)
     return float(se_mean / sd * math.sqrt(periods_per_year))
+
+
+def newey_west_mean_se(x: pd.Series | np.ndarray, lags: int | None = None) -> float:
+    """Autocorrelation-robust (Bartlett kernel) standard error of a sample mean; use ``lags >= h - 1``
+    for statistics of overlapping ``h``-period returns."""
+    r = np.asarray(x, dtype=float)
+    r = r[np.isfinite(r)]
+    n = len(r)
+    if n < 3:
+        return float("nan")
+    lags = math.floor(4 * (n / 100) ** (2 / 9)) if lags is None else int(lags)
+    rc = r - r.mean()
+    lr_var = float(np.dot(rc, rc) / n)
+    for k in range(1, min(lags, n - 1) + 1):
+        lr_var += 2 * (1.0 - k / (lags + 1)) * float(np.dot(rc[k:], rc[:-k]) / n)
+    return math.sqrt(max(lr_var, 1e-30) / n)
+
+
+def newey_west_tstat(x: pd.Series | np.ndarray, lags: int | None = None) -> float:
+    r = np.asarray(x, dtype=float)
+    r = r[np.isfinite(r)]
+    se = newey_west_mean_se(r, lags)
+    return float(r.mean() / se) if se and np.isfinite(se) and se > 0 else float("nan")
 
 
 def block_bootstrap_ci(returns: pd.Series | np.ndarray, stat=sharpe_ratio, block_len: int = 20, n_boot: int = 1000, alpha: float = 0.05, seed: int = 0) -> tuple[float, float, float]:
@@ -81,6 +105,9 @@ def deflated_sharpe_ratio(observed_sr: float, n_trials: int, n_obs: int, skew: f
     Sharpe ratios; ``observed_sr`` annualised is converted. States assumptions explicitly."""
     sr = observed_sr / math.sqrt(periods_per_year)
     euler = 0.5772156649
+    heuristic = var_trial_sr is None and n_trials > 1
+    if heuristic:
+        warnings.warn("deflated_sharpe_ratio: no cross-trial Sharpe variance supplied; using the heuristic sr^2/2n. Pass var_trial_sr from the trial ledger (governance.TrialLedger).", stacklevel=2)
     v = var_trial_sr if var_trial_sr is not None else (sr ** 2) * 0.5 / max(n_trials, 1)
     if n_trials <= 1:
         sr0 = 0.0
@@ -88,7 +115,7 @@ def deflated_sharpe_ratio(observed_sr: float, n_trials: int, n_obs: int, skew: f
         sr0 = math.sqrt(v) * ((1 - euler) * _norm_ppf(1 - 1.0 / n_trials) + euler * _norm_ppf(1 - 1.0 / (n_trials * math.e)))
     denom = math.sqrt(max(1 - skew * sr + (kurt - 1) / 4 * sr ** 2, 1e-12))
     z = (sr - sr0) * math.sqrt(max(n_obs - 1, 1)) / denom
-    return {"dsr": _norm_cdf(z), "expected_max_sr_annual": sr0 * math.sqrt(periods_per_year), "observed_sr_annual": observed_sr, "n_trials": n_trials, "assumptions": "trials treated as independent; correlated variants overstate n_trials; non-normality via skew/kurt"}
+    return {"dsr": _norm_cdf(z), "expected_max_sr_annual": sr0 * math.sqrt(periods_per_year), "observed_sr_annual": observed_sr, "n_trials": n_trials, "var_trial_sr": v, "var_trial_sr_source": "heuristic" if heuristic else ("supplied" if var_trial_sr is not None else "single trial"), "assumptions": "trials treated as independent; correlated variants overstate n_trials; non-normality via skew/kurt"}
 
 
 def min_track_record_length(observed_sr: float, benchmark_sr: float = 0.0, skew: float = 0.0, kurt: float = 3.0, confidence: float = 0.95, periods_per_year: int = 252) -> float:
@@ -119,4 +146,4 @@ def probability_of_backtest_overfitting(perf: pd.DataFrame | np.ndarray, n_split
     return {"pbo": float(np.mean(logits <= 0)), "n_combinations": len(logits), "mean_logit": float(np.mean(logits)), "assumptions": "variants evaluated on identical dates; a common stress episode is not independent evidence"}
 
 
-__all__ = ["block_bootstrap_ci", "deflated_sharpe_ratio", "min_track_record_length", "newey_west_sharpe_se", "probability_of_backtest_overfitting", "sharpe_ratio"]
+__all__ = ["block_bootstrap_ci", "deflated_sharpe_ratio", "min_track_record_length", "newey_west_mean_se", "newey_west_sharpe_se", "newey_west_tstat", "probability_of_backtest_overfitting", "sharpe_ratio"]

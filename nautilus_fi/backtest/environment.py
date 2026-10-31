@@ -20,6 +20,7 @@ import pandas as pd
 
 from nautilus_fi.core.registry import DependencyGraph, Node, SupportMatrix, UnsupportedCombination
 from nautilus_fi.data import schemas
+from nautilus_fi.data.panel import Panel
 from nautilus_fi.data.reference import reference_from_dataframe
 from nautilus_fi.data.trace import daily_liquidity_stats
 from nautilus_fi.data.types import (
@@ -32,6 +33,8 @@ from nautilus_fi.data.types import (
     StressIndex,
     wrap,
 )
+from nautilus_fi.domain.conventions import WeightDrift
+from nautilus_fi.domain.fields import AnalyticsSource
 from nautilus_fi.execution.costs import ParametricCostModel
 from nautilus_fi.execution.fill_model import NewIssueTerms
 from nautilus_fi.execution.liquidity import TYPICAL_SIZE, LiquidityStats, VolumeGatedLiquidityModel
@@ -39,7 +42,7 @@ from nautilus_fi.execution.windows import ExecutionWindowSchedule
 from nautilus_fi.instruments.analytics import BondAnalytics, accrued_interest, analyse
 from nautilus_fi.instruments.bond import BondSpec, face_to_units
 from nautilus_fi.instruments.calendar import BondCalendar, get_calendar
-from nautilus_fi.instruments.cashflows import MarketInputs, factor_at
+from nautilus_fi.instruments.cashflows import MarketInputs, factor_at, period_coupon_amount
 from nautilus_fi.instruments.conventions import (
     EntitlementRule,
     SettlementConventions,
@@ -64,7 +67,12 @@ from nautilus_fi.pricing.waterfall import (
 )
 from nautilus_fi.support import default_support_matrix
 
+NS_DAY = 86_400_000_000_000
 TIER_EVIDENCE = {MarkTier.TRADE: EvidenceType.TRANSACTION, MarkTier.COMPOSITE: EvidenceType.COMPOSITE, MarkTier.EVALUATED: EvidenceType.EVALUATED, MarkTier.MODEL: EvidenceType.MODEL, MarkTier.STALE_ROLLED: EvidenceType.STALE, MarkTier.NONE: EvidenceType.STALE}
+
+
+def _mark_quality(mk: MarkResult) -> float:
+    return mk.quality if mk.tier in (MarkTier.EVALUATED, MarkTier.MODEL) else (0.9 if mk.tier in (MarkTier.TRADE, MarkTier.COMPOSITE) else 0.2)
 
 
 @dataclass
@@ -119,6 +127,13 @@ class MarketEnvironment:
     _defaults: dict[str, date] = field(default_factory=dict, repr=False)
     _actions_by_date: dict[date, list[ActionRecord]] = field(default_factory=dict, repr=False)
     _stale_recorded: set[date] = field(default_factory=set, repr=False)
+    field_panel: Panel | None = None                  # generic fields (vendor analytics, signals, index weights ...) published to the context
+    benchmark_obj: object | None = None               # benchmarks.Benchmark built from constituents
+    analytics_source: str = "COMPUTED"
+    analytics_discrepancies: list = field(default_factory=list)
+    vendor_accrued: dict[tuple[str, date], float] = field(default_factory=dict)
+    _structured: set[str] = field(default_factory=set, repr=False)
+    _structured_n: int = field(default=-1, repr=False)
 
     def __post_init__(self) -> None:
         self._dates_set = set(self.dates)
@@ -183,7 +198,11 @@ class MarketEnvironment:
 
     def liquidity_stats(self, symbol: str, d: date, at: str = "window") -> LiquidityStats:
         src = self.liquidity_window if at == "window" else self.liquidity
-        return src.get((symbol, d), LiquidityStats(amount_outstanding=self.bonds[symbol].amount_outstanding if symbol in self.bonds else None))
+        v = src.get((symbol, d))
+        if v is not None:
+            return v
+        mk = self.marks.get((symbol, d))
+        return LiquidityStats(quote_score=_mark_quality(mk) if mk is not None else 0.0, amount_outstanding=self.bonds[symbol].amount_outstanding if symbol in self.bonds else None)
 
     def stress(self, d: date) -> float:
         return self.stress_series.get(d, 0.0)
@@ -290,6 +309,105 @@ class MarketEnvironment:
         cpi = self.cpi.get(bond.inflation.index) if (bond.inflation and bond.coupon_type == CouponType.INFLATION_LINKED) else None
         return MarketInputs(fixings=fix, realized_factors=facs, index_ratios=ratios, default_date=dflt if (dflt and dflt <= d) else None, daily_fixings=daily, index_values=self.index_values or None, cpi=cpi, cpi_base=self.cpi_base.get(symbol), known_as_of=d)
 
+    def accrued(self, symbol: str, d: date) -> float:
+        """Accrued per 100 current face for a trade dated ``d`` (standard settlement). Terms-free
+        bonds use the vendor's accrued (latest within five days); others accrue from their terms."""
+        bond = self.bonds[symbol]
+        if bond.terms_free:
+            v = self.vendor_accrued.get((symbol, d))
+            if v is None:
+                p = d
+                for _ in range(5):
+                    p = self.prev_trading_date(p)
+                    if p is None:
+                        break
+                    v = self.vendor_accrued.get((symbol, p))
+                    if v is not None:
+                        break
+            return float(v) if v is not None else 0.0
+        return accrued_interest(bond, self.settle_date(bond, d), self.market_inputs(symbol, d))
+
+    def field_value(self, name: str, symbol: str, d: date) -> float | None:
+        """Generic field value for ``symbol`` usable on ``d`` (availability lag applied)."""
+        if self.field_panel is None or name not in self.field_panel:
+            return None
+        i = self.field_panel.date_pos(d)
+        j = self.field_panel.id_pos([symbol])[0]
+        if i < 0 or j < 0:
+            return None
+        v = self.field_panel.asof_row(name, i)[j]
+        return None if not np.isfinite(v) else float(v)
+
+    def total_return_panel(self, symbols: list[str] | None = None) -> Panel:
+        """Daily total returns per 100 original face from the marks: dirty value (clean + accrued) x
+        factor, plus coupons and principal paid that day (schedule, supplied cashflows or tranche
+        allocations) and redemptions at their price. Used for drifting benchmark weights and to put
+        the panel engine on exactly the prices the event engine marks with."""
+        syms = list(symbols or self.bonds)
+        T = len(self.dates)
+        tr = np.full((T, len(syms)), np.nan)
+        dirty = np.full((T, len(syms)), np.nan)
+        alive = np.zeros((T, len(syms)))
+        oad = np.full((T, len(syms)), np.nan)
+        oasd = np.full((T, len(syms)), np.nan)
+        oas = np.full((T, len(syms)), np.nan)
+        hs = np.full((T, len(syms)), np.nan)
+        px = np.full((T, len(syms)), np.nan)
+        pays: dict[str, dict[date, float]] = {}
+        for (sym, pay), (ipp, ppp) in self.tranche_payments.items():
+            pays.setdefault(sym, {})[pay] = pays.get(sym, {}).get(pay, 0.0) + ipp + ppp
+        for j, sym in enumerate(syms):
+            bond = self.bonds[sym]
+            term = self._terminations.get(sym)
+            prev_dirty = None
+            prev_d = None
+            sched = [] if (bond.terms_free or sym in pays or bond.coupon_type == CouponType.ZERO) else bond.schedule
+            k = 0
+            for t, d in enumerate(self.dates):
+                mk = self.marks.get((sym, d))
+                redeem = term is not None and term[0] == d and term[1] in ("CALL", "PUT", "TENDER", "MATURITY", "RECOVERY")
+                if mk is None and not redeem:
+                    if prev_dirty is not None and term is not None and d > term[0]:
+                        prev_dirty = None
+                    continue
+                f = self.factor(sym, d)
+                acc = 0.0 if self.is_defaulted(sym, d) else self.accrued(sym, d)
+                if redeem:
+                    act = next((a for a in self._actions_by_date.get(d, []) if a.symbol == sym and a.action == term[1]), None)
+                    price = act.price if (act is not None and act.price is not None) else (mk.clean_mid if mk else 100.0)
+                    value = price * f + (0.0 if self.is_defaulted(sym, d) else acc * f)
+                else:
+                    value = (mk.clean_mid + acc) * f
+                cf = 0.0
+                if prev_d is not None:
+                    if sym in pays:
+                        cf = sum(v for pd_, v in pays[sym].items() if prev_d < pd_ <= d)
+                    else:
+                        while k < len(sched) and sched[k].payment_date <= d:
+                            if sched[k].payment_date > prev_d and not self.is_defaulted(sym, sched[k].payment_date):
+                                cf += period_coupon_amount(bond, sched[k], self.market_inputs(sym, d)) * self.factor(sym, sched[k].accrual_start)
+                            k += 1
+                        if bond.principal_type in (PrincipalType.AMORTIZING, PrincipalType.SINKING):
+                            fp = self.factor(sym, prev_d)
+                            if f < fp:
+                                cf += (fp - f) * (bond.amortization.paydown_price if bond.amortization else 100.0)
+                else:
+                    while k < len(sched) and sched[k].payment_date <= d:
+                        k += 1
+                if prev_dirty is not None and prev_dirty > 0:
+                    tr[t, j] = (value + cf) / prev_dirty - 1.0
+                dirty[t, j] = value
+                alive[t, j] = 1.0
+                an = self.analytics_by_key.get((sym, d))
+                if an is not None:
+                    oad[t, j], oasd[t, j], oas[t, j] = an.mod_duration if an.mod_duration is not None else np.nan, an.spread_duration if an.spread_duration is not None else np.nan, an.z_spread_bp if an.z_spread_bp is not None else np.nan
+                if mk is not None:
+                    hs[t, j] = (mk.clean_ask - mk.clean_bid) / 2.0 / mk.clean_mid * 1e4 if mk.clean_mid else np.nan
+                    px[t, j] = mk.clean_mid
+                prev_dirty, prev_d = (None, None) if redeem else (value, d)
+        vals = {"tr": tr, "price_dirty": dirty, "alive": alive, "oad": oad, "oasd": oasd, "oas_bp": oas, "dts": oasd * oas, "half_spread_bp": hs, "price_clean": px}
+        return Panel(pd.DatetimeIndex(pd.to_datetime(self.dates)), pd.Index(syms), vals)
+
     def entitlement_rule(self, bond: BondSpec) -> EntitlementRule:
         return entitlement_rule(market_for(bond.asset_type, bond.currency, bond.country))
 
@@ -303,7 +421,10 @@ class MarketEnvironment:
         return TIER_EVIDENCE.get(m.tier, EvidenceType.STALE) if m else EvidenceType.STALE
 
     def is_structured(self, symbol: str) -> bool:
-        return any(k[0] == symbol for k in self.tranche_payments)
+        if len(self.tranche_payments) != self._structured_n:          # payments added after construction
+            self._structured = {k[0] for k in self.tranche_payments}
+            self._structured_n = len(self.tranche_payments)
+        return symbol in self._structured
 
     def actions_effective(self, d: date) -> list[ActionRecord]:
         return self._actions_by_date.get(d, [])
@@ -326,7 +447,12 @@ class MarketEnvironment:
     def instruments(self, venue: str = "OTC") -> list:
         return [b.to_instrument(venue) for b in self.bonds.values()]
 
-    def nautilus_data(self, venue: str = "OTC") -> list:
+    def nautilus_data(self, venue: str = "OTC", start: date | None = None, end: date | None = None) -> list:
+        """The Nautilus data stream; ``start`` / ``end`` restrict it to a date window (streamed runs
+        feed the engine one window at a time)."""
+        return self._nautilus_data(venue, start, end)
+
+    def _nautilus_data(self, venue: str, start: date | None, end: date | None) -> list:
         from nautilus_trader.model import (
             InstrumentClose,
             InstrumentCloseType,
@@ -349,6 +475,15 @@ class MarketEnvironment:
             return Price(max(round(value, p), 10 ** (-p)), p)
 
         for d in self.dates:
+            if (start is not None and d < start) or (end is not None and d > end):
+                if start is not None and d < start:                   # keep change detection state across windows
+                    for s in self.alive_symbols(d):
+                        r = self.rating_score(s, d)
+                        if r is not None:
+                            last_rating[s] = r
+                        if self.bonds[s].is_factor_driven:
+                            last_factor[s] = self.factor(s, d)
+                continue
             w_ns, m_ns, p_ns = sched.window_ns(d), sched.mark_ns(d), sched.publish_ns(d)
             for s in self.alive_symbols(d):
                 bond = self.bonds[s]
@@ -366,7 +501,7 @@ class MarketEnvironment:
                 f = self.factor(s, d)
                 an = self.analytics_by_key.get((s, d))
                 out.append(MarkPriceUpdate(ids[s], px(s, mk.clean_mid * f), m_ns, p_ns))
-                accrued = 0.0 if self.is_defaulted(s, d) else accrued_interest(bond, self.settle_date(bond, d), self.market_inputs(s, d))
+                accrued = 0.0 if self.is_defaulted(s, d) else self.accrued(s, d)
                 out.append(wrap(BondMark(ts_event=m_ns, ts_init=p_ns, instrument_id=ids[s], clean_mid=mk.clean_mid, clean_bid=mk.clean_bid, clean_ask=mk.clean_ask, factor=f, accrued=accrued, tier=mk.tier.value, quality=mk.quality, source=mk.source,
                                          ytm=float(an.ytm) if an and an.ytm is not None else float("nan"), mod_duration=float(an.mod_duration) if an and an.mod_duration is not None else float("nan"), spread_duration=float(an.spread_duration) if an and an.spread_duration is not None else float("nan"), z_spread_bp=float(an.z_spread_bp) if an and an.z_spread_bp is not None else float("nan"), stale_days=int(mk.stale_days))))
                 r = self.rating_score(s, d)
@@ -388,10 +523,14 @@ class MarketEnvironment:
             for a in self._actions_by_date.get(d, []):
                 if a.action in ("CALL", "PUT", "TENDER", "MATURITY", "RECOVERY") and a.price is not None and a.symbol in ids:
                     out.append(InstrumentClose(ids[a.symbol], px(a.symbol, a.price * self.factor(a.symbol, d)), InstrumentCloseType.CONTRACT_EXPIRED, m_ns, m_ns))
+        lo = sched.window_ns(start) - NS_DAY if start is not None else None
+        hi = sched.window_ns(end) + NS_DAY if end is not None else None
         for a in self.actions:
             if a.symbol not in ids:
                 continue
             ts = int(_utc(a.announce_ts).value)
+            if (start is not None and ts < lo and start != self.dates[0]) or (hi is not None and ts >= hi):
+                continue
             out.append(wrap(CorporateAction(ts_event=ts, ts_init=ts, instrument_id=ids[a.symbol], action=a.action, effective_date=a.effective_date.isoformat(), price=float(a.price) if a.price is not None else float("nan"), note=a.note)))
         return out
 
@@ -454,6 +593,13 @@ class MarketEnvironmentBuilder:
         self.new_issues: dict[str, NewIssueTerms] = {}
         self._liq_model = VolumeGatedLiquidityModel()
         self.calibrator = CurveCalibrator()
+        self.analytics_df: pd.DataFrame | None = None
+        self.analytics_source = AnalyticsSource.COMPUTED
+        self.field_frames: list[tuple[pd.DataFrame, list[str], dict]] = []
+        self.constituents: tuple[pd.DataFrame, str, WeightDrift, str] | None = None
+        self.supplied_df: pd.DataFrame | None = None
+        self._vendor: dict[tuple[str, date], int] = {}
+        self._vendor_cols: dict[str, np.ndarray] = {}
 
     # ---- inputs (fluent) ---------------------------------------------------------------
     def with_evaluated_prices(self, df):
@@ -521,6 +667,66 @@ class MarketEnvironmentBuilder:
     def with_new_issues(self, terms: dict[str, NewIssueTerms]):
         self.new_issues = dict(terms)
         return self
+
+    def with_analytics(self, df, source: AnalyticsSource | str = AnalyticsSource.VENDOR_ELSE_COMPUTED):
+        """Vendor analytics per bond-date (``oas_bp`` / ``z_spread_bp``, ``oad`` / ``mod_duration``, ``oasd`` /
+        ``spread_duration``, ``ytm``, ``ytw``, ``convexity``, ``dv01``, ``wal``, ``krd_<tenor>``). ``source``:
+        VENDOR (vendor only), VENDOR_ELSE_COMPUTED, COMPARE (use vendor, record differences from the
+        computed analytics in ``env.analytics_discrepancies``) or COMPUTED (ignore the vendor)."""
+        self.analytics_df = schemas.ANALYTICS.validate(df)
+        self.analytics_source = AnalyticsSource(source)
+        return self
+
+    def with_fields(self, df, fields: list[str] | None = None, lags: dict[str, int] | None = None):
+        """Generic per-bond fields (long frame: date, instrument_id, one column per field) published to
+        the decision context as point-in-time cross-sections: signals, vendor returns, index weights.
+        ``lags``: availability lag in trading days per field (default: the field registry)."""
+        df = schemas.FIELDS.validate(df)
+        cols = fields or [c for c in df.columns if c not in ("date", "instrument_id", "publish_ts")]
+        self.field_frames.append((df, list(cols), dict(lags or {})))
+        return self
+
+    def with_benchmark_constituents(self, df, name: str = "BENCHMARK", drift: WeightDrift | str = WeightDrift.DRIFT, field_name: str = "benchmark.weight"):
+        """Benchmark constituents and weights per reconstitution date. Daily weights (drifting with
+        returns between reconstitutions, or static) are published as ``field_name``; the benchmark's
+        return series becomes the run's benchmark when none is given."""
+        self.constituents = (schemas.BENCHMARK_CONSTITUENTS.validate(df), name, WeightDrift(drift), field_name)
+        return self
+
+    def with_supplied_cashflows(self, df):
+        """Coupons and principal per 100 original face by pay date for terms-free bonds (paid to the
+        holder under the market's entitlement rule, like deal-waterfall allocations)."""
+        self.supplied_df = schemas.SUPPLIED_CASHFLOWS.validate(df)
+        return self
+
+    def _parse_vendor_analytics(self) -> None:
+        """Index vendor rows by (symbol, date) over column arrays (no per-row dictionaries)."""
+        self._vendor = {}
+        self._vendor_cols = {}
+        if self.analytics_df is None or self.analytics_df.empty:
+            return
+        a = self.analytics_df.rename(columns={"z_spread_bp": "oas_bp", "mod_duration": "oad", "spread_duration": "oasd"})
+        cols = [c for c in a.columns if c not in ("date", "instrument_id", "publish_ts")]
+        dates = pd.to_datetime(a["date"]).dt.date.to_numpy()
+        syms = a["instrument_id"].astype(str).to_numpy()
+        ok = np.ones(len(a), dtype=bool)
+        if "publish_ts" in a:
+            pub = pd.to_datetime(a["publish_ts"], utc=True).astype("int64").to_numpy()
+            ok = pub <= np.array([self.schedule.publish_ns(d_) for d_ in dates])
+        self._vendor_cols = {c: pd.to_numeric(a[c], errors="coerce").to_numpy(dtype=float) for c in cols}
+        self._vendor = {(syms[i], dates[i]): i for i in np.nonzero(ok)[0]}
+
+    def _vendor_row(self, i: int) -> dict:
+        return {c: v[i] for c, v in self._vendor_cols.items() if np.isfinite(v[i])}
+
+    def _vendor_analytics(self, env: MarketEnvironment, s: str, d: date, mk: MarkResult, v: dict) -> BondAnalytics:
+        bond = self.bonds[s]
+        acc = env.accrued(s, d)
+        krd = {float(k[4:]): float(x) for k, x in v.items() if k.startswith("krd_")}
+        an = BondAnalytics(settle=env.settle_date(bond, d), clean_price=mk.clean_mid, accrued=acc, dirty_price=mk.clean_mid + acc, factor=env.factor(s, d), ytm=v.get("ytm"), ytw=v.get("ytw", v.get("ytm")), mod_duration=v.get("oad"), convexity=v.get("convexity"), dv01=v.get("dv01"), spread_duration=v.get("oasd", v.get("oad")), z_spread_bp=v.get("oas_bp"), wal=v.get("wal"), years_to_maturity=bond.remaining_years(d), key_rate_durations=krd)
+        if an.dv01 is None and an.mod_duration is not None:
+            an.dv01 = an.mod_duration * an.dirty_price * 1e-4
+        return an
 
     # ---- helpers -------------------------------------------------------------------------
     def _indicative_half_spread(self, bond: BondSpec, d: date) -> float:
@@ -633,8 +839,13 @@ class MarketEnvironmentBuilder:
                     g.require(s, f"cpi:{b.inflation.index}", "index", "linker needs CPI history")
                 else:
                     g.require(s, f"index_ratios:{s}", "ratio", "linker needs index ratios or CPI")
-            if b.is_callable:
+            if b.is_callable and not b.terms_free:
                 g.require(s, "model:hw1f-trinomial", "", "callable needs an exercise/valuation model")
+            if b.terms_free:
+                if not any(k[0] == s for k in env.vendor_accrued):
+                    g.require(s, f"vendor_accrued:{s}", "per 100", "terms-free bond needs vendor accrued (evaluated_prices.accrued)")
+                if b.coupon_type != CouponType.ZERO and not env.is_structured(s):
+                    g.require(s, f"supplied_cashflows:{s}", "per 100", "terms-free coupon bond needs supplied cashflows")
         problems = g.validate()
         return problems
 
@@ -671,9 +882,12 @@ class MarketEnvironmentBuilder:
             b = self.benchmark_df.copy()
             benchmark = pd.Series(b["total_return"].astype(float).to_numpy(), index=pd.to_datetime(b["date"]), name="benchmark")
         tranche_payments: dict[tuple[str, date], tuple[float, float]] = {}
-        if self.tranche_df is not None and not self.tranche_df.empty:
-            for _, r in self.tranche_df.iterrows():
-                tranche_payments[(str(r["symbol"]), _date(r["pay_date"]))] = (float(r.get("interest_per_100", 0.0)), float(r.get("principal_per_100", 0.0)))
+        for frame in (self.tranche_df, self.supplied_df):
+            if frame is not None and not frame.empty:
+                for _, r in frame.iterrows():
+                    ipp = r.get("interest_per_100", 0.0)
+                    ppp = r.get("principal_per_100", 0.0)
+                    tranche_payments[(str(r["symbol"]), _date(r["pay_date"]))] = (0.0 if pd.isna(ipp) else float(ipp), 0.0 if pd.isna(ppp) else float(ppp))
         cpi_base: dict[str, float] = {}
         for s, b in self.bonds.items():
             if b.coupon_type == CouponType.INFLATION_LINKED and b.inflation and b.inflation.index in cpi:
@@ -688,6 +902,11 @@ class MarketEnvironmentBuilder:
         env = MarketEnvironment(bonds=self.bonds, dates=dates, schedule=self.schedule, calendar=self.calendar, curves=curves, marks={}, analytics_by_key={}, liquidity={}, stress_series=stress_series, fixings=fixings, factors=factors, index_ratios=ratios, ratings=ratings, actions=actions, benchmark=benchmark, new_issues=self.new_issues, curve_name=self.curve_name,
                                 reference_policy=self.reference_policy, calibration_log=log, curve_status=curve_status, ois_curves=ois, max_stale_curve_days=self.max_stale_curve_days, fx_rates=fx, cpi=cpi, cpi_base=cpi_base, daily_fixings=daily_fixings, tranche_payments=tranche_payments, support=self.support, base_currency=self.base_currency)
 
+        if self.evaluated is not None and not self.evaluated.empty and "accrued" in self.evaluated:
+            ev_ = self.evaluated[self.evaluated["accrued"].notna()]
+            env.vendor_accrued = {(str(i), _date(dd)): float(a_) for i, dd, a_ in zip(ev_["instrument_id"], ev_["date"], ev_["accrued"])}
+        env.analytics_source = self.analytics_source.value
+        self._parse_vendor_analytics()
         problems = self._validate_dependencies(env)
         env.validation_problems = problems
         if problems:
@@ -700,14 +919,24 @@ class MarketEnvironmentBuilder:
 
         # observations indexed by (symbol, date)
         ev_by: dict[tuple[str, date], EvaluatedObs] = {}
+        late: dict[tuple[str, date], EvaluatedObs] = {}
         if self.evaluated is not None and not self.evaluated.empty:
             ev = self.evaluated
             pub = pd.to_datetime(ev["publish_ts"], utc=True) if "publish_ts" in ev else None
             for i, r in enumerate(ev.itertuples(index=False)):
                 d = _date(r.date)
+                obs = EvaluatedObs(float(r.mid), getattr(r, "bid", None) if "bid" in ev else None, getattr(r, "ask", None) if "ask" in ev else None, float(r.score) if "score" in ev and not pd.isna(r.score) else None, str(getattr(r, "source", "EVALUATED")) if "source" in ev else "EVALUATED")
                 if pub is not None and pub.iloc[i].value > self.schedule.publish_ns(d):
+                    # published after this date's mark time: usable from the first trading day whose
+                    # publication time follows it (an evaluation one day old), never on its own date
+                    nxt = self.calendar.next_business_day(d)
+                    while self.schedule.publish_ns(nxt) < pub.iloc[i].value:
+                        nxt = self.calendar.next_business_day(nxt)
+                    late[(str(r.instrument_id), nxt)] = obs
                     continue
-                ev_by[(str(r.instrument_id), d)] = EvaluatedObs(float(r.mid), getattr(r, "bid", None) if "bid" in ev else None, getattr(r, "ask", None) if "ask" in ev else None, float(r.score) if "score" in ev and not pd.isna(r.score) else None, str(getattr(r, "source", "EVALUATED")) if "source" in ev else "EVALUATED")
+                ev_by[(str(r.instrument_id), d)] = obs
+            for k, obs in late.items():
+                ev_by.setdefault(k, obs)
         comp_by: dict[tuple[str, date], QuoteObs] = {}
         if self.composite is not None and not self.composite.empty:
             for r in self.composite.itertuples(index=False):
@@ -762,13 +991,13 @@ class MarketEnvironmentBuilder:
                 last = prev_marks.get(s)
                 last_an = prev_analytics.get(s, (None, None))[1]
                 model_px = None
-                if curve is not None and obs_for_fit:
+                if curve is not None and obs_for_fit and not bond.terms_free:     # matrix pricing needs cashflows from terms
                     dur = last_an.mod_duration if last_an and last_an.mod_duration is not None else (bond.remaining_years(d) or 5.0) * 0.8
                     res = self.matrix.price(bond, env.settle_date(bond, d), curve, dur, env.rating_score(s, d), env.market_inputs(s, d))
                     if res is not None and res[0] > 0:
                         model_px = res[0]
                 rolled = None
-                if self.roll_stale and last is not None and curve is not None and prev_curve is not None:
+                if self.roll_stale and last is not None and curve is not None and prev_curve is not None and not bond.terms_free:
                     bucket_now = self.matrix.bucket_spread(bond, last_an.mod_duration if last_an and last_an.mod_duration else 5.0, env.rating_score(s, d)) if obs_for_fit else None
                     rolled = roll_mark(last.clean_mid, last_an.mod_duration if last_an else None, last_an.spread_duration if last_an else None, bond.remaining_years(d), last_an.ytm if last_an else None, bond.coupon_rate_on(d), RollInputs(prev_curve, curve, prev_bucket_spread.get(s), bucket_now, max(1, (d - last_mark_date.get(s, d)).days)), int(bond.frequency) or 2)
                     if bucket_now is not None:
@@ -788,17 +1017,73 @@ class MarketEnvironmentBuilder:
                     bs = self.matrix.bucket_spread(self.bonds[s], an.mod_duration, env.rating_score(s, d))
                     if bs is not None:
                         prev_bucket_spread[s] = bs
-                quality = mk.quality if mk.tier in (MarkTier.EVALUATED, MarkTier.MODEL) else (0.9 if mk.tier in (MarkTier.TRADE, MarkTier.COMPOSITE) else 0.2)
-                v, n, since = liq_by.get((s, d), (0.0, 0, 9_999))
-                env.liquidity[(s, d)] = LiquidityStats(v, n, since, quality, self.bonds[s].amount_outstanding, mk.tier == MarkTier.COMPOSITE)
-                vw, nw, sw = liqw_by.get((s, d), (0.0, 0, 9_999))
-                env.liquidity_window[(s, d)] = LiquidityStats(vw, nw, sw, quality, self.bonds[s].amount_outstanding, (s, d) in env.window_quotes)
+                # liquidity is stored only where trades or quotes say something; other bond-days are
+                # derived from the mark on access (no per-bond-day object for an untraded bond)
+                if (s, d) in liq_by or mk.tier == MarkTier.COMPOSITE:
+                    v, n, since = liq_by.get((s, d), (0.0, 0, 9_999))
+                    env.liquidity[(s, d)] = LiquidityStats(v, n, since, _mark_quality(mk), self.bonds[s].amount_outstanding, mk.tier == MarkTier.COMPOSITE)
+                if (s, d) in liqw_by or (s, d) in env.window_quotes:
+                    vw, nw, sw = liqw_by.get((s, d), (0.0, 0, 9_999))
+                    env.liquidity_window[(s, d)] = LiquidityStats(vw, nw, sw, _mark_quality(mk), self.bonds[s].amount_outstanding, (s, d) in env.window_quotes)
             if curve is not None:
                 prev_curve = curve
+        self._attach_fields(env)
+        self._vendor, self._vendor_cols = {}, {}              # the parsed vendor rows now live in the environment's analytics
         return env
+
+    def _attach_fields(self, env: MarketEnvironment) -> None:
+        syms = list(self.bonds)
+        dates = pd.DatetimeIndex(pd.to_datetime(env.dates))
+        panel = None
+        for df, cols, lags in self.field_frames:
+            p = Panel.from_long(df, cols, dates=dates, ids=syms)
+            for c in cols:
+                if c in lags:
+                    p.lags[c] = int(lags[c])
+            if panel is None:
+                panel = p
+            else:
+                for c in cols:
+                    panel.with_field(c, p[c], p.lags.get(c))
+        if self.constituents is not None:
+            from nautilus_fi.benchmarks.benchmark import ConstituentBenchmark
+
+            cons, name, drift, field_name = self.constituents
+            members = [m for m in pd.unique(cons["instrument_id"].astype(str)) if m in self.bonds]
+            if panel is not None and "tr" in panel:
+                rets = panel.subset(ids=members)
+                rets.with_field("alive", np.isfinite(rets["tr"]).astype(float))
+            else:
+                rets = env.total_return_panel(members)
+            bench = ConstituentBenchmark(name, cons[cons["instrument_id"].astype(str).isin(members)], drift)
+            W = bench.weight_matrix(rets, "tr")
+            full = np.zeros((len(dates), len(syms)))
+            full[:, [syms.index(m) for m in rets.ids]] = W
+            if panel is None:
+                panel = Panel(dates, pd.Index(syms), {})
+            panel.with_field(field_name, full, 0)
+            env.benchmark_obj = bench
+            if env.benchmark is None:
+                env.benchmark = bench.returns(rets, "tr")
+        env.field_panel = panel
 
     def _analytics(self, env: MarketEnvironment, s: str, d: date, mk: MarkResult, curve: ZeroCurve | None, prev: dict[str, tuple[date, BondAnalytics]]) -> BondAnalytics | None:
         bond = self.bonds[s]
+        pol = self.analytics_source
+        vi = self._vendor.get((s, d)) if pol != AnalyticsSource.COMPUTED else None
+        if vi is not None:
+            an = self._vendor_analytics(env, s, d, mk, self._vendor_row(vi))
+            if pol == AnalyticsSource.COMPARE and not bond.terms_free:
+                try:
+                    c = analyse(bond, env.settle_date(bond, d), mk.clean_mid, curve, env.market_inputs(s, d), env.factor(s, d), self.analytics_cfg.krd_tenors)
+                    env.analytics_discrepancies.append({"date": d, "symbol": s, "oas_vendor": an.z_spread_bp, "oas_computed": c.z_spread_bp, "oad_vendor": an.mod_duration, "oad_computed": c.mod_duration, "oasd_vendor": an.spread_duration, "oasd_computed": c.spread_duration, "ytm_vendor": an.ytm, "ytm_computed": c.ytm})
+                except Exception as e:  # noqa: BLE001 - the comparison must not break the build
+                    env.analytics_discrepancies.append({"date": d, "symbol": s, "error": f"{type(e).__name__}: {e}"})
+            prev[s] = (d, an)
+            env.analytics_by_key[(s, d)] = an
+            return an
+        if pol == AnalyticsSource.VENDOR or bond.terms_free:
+            return None
         last = prev.get(s)
         n = self.analytics_cfg.every_n_days
         if last is not None and n > 1 and (d - last[0]).days < n and abs(last[1].clean_price - mk.clean_mid) < 1.0:

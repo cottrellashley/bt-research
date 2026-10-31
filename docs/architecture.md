@@ -44,8 +44,21 @@ reports/       report bundle (performance, implementation, evidence, risk, attri
                invariants, unknowns) and order / payment explainers
 backtest/      MarketEnvironmentBuilder, FixedIncomeBacktest (manifest, validation, wiring, status), strategy base,
                environment actor, results, scenarios
-synthetic/     synthetic market generator covering every product family
+synthetic/     synthetic market generator covering every product family; index-scale panel universe
+domain/        conventions (timing, excess return, drift, turnover, annualisation, missing returns), rebalance
+               calendars, field definitions, ResearchSpec / Decider / DecisionView / Target
+benchmarks/    constituent, custom, composite and return-series benchmarks
+construct/     cross-sections, signal transforms, constraint grammar, construction methods, HiGHS optimiser
+paper/         panel engine (Paper), signal evaluation (Evaluate), Paper / Implement reconciliation
+governance/    trial ledger, walk-forward with purge / embargo, gated official records
+overlays/      margin-venue contracts and fill model; accounting/margin.py books them in the ledger
+propose/       trade proposals, OMS / PORT writers, pre-trade validation, reconciliation
+data/loaders/  SQL, Snowflake, FIAtlas catalogue and file loaders into the point-in-time stores
 ```
+
+The panel engine and the event engine share the domain model: a `ResearchSpec` runs in both (the
+event engine through `backtest.spec_strategy.SpecStrategy`, whose `ContextView` is built only from the
+restricted context), and `paper.reconcile` decomposes the difference. See `docs/generalisation.md`.
 
 ## A trading day
 
@@ -141,6 +154,9 @@ engine adapter is the contract for Intex-style engines; it is not integrated.
 * Strategies: subclass `FixedIncomeStrategy`; use only the `DecisionContext` (`self.ctx`) and the
   services the engine hands you (`self.services`); override `on_funding_shortfall` for a mandate
   specific liquidation rule.
-* Derivative overlays: valuation and margin postings exist (`instruments.derivatives`,
-  `accounting.postings`); trading them inside the Nautilus venue needs a margin venue and is not
-  wired (see `docs/blueprint_status.md`).
+* Derivative overlays: `BacktestSettings(margin=MarginSettings(collateral, book=OverlayBook(...)))`
+  adds a MARGIN venue; contracts are `overlays.FinancedContract` (index TRS, CDX, synthetic bond TRS,
+  carry instruments: daily carry as Nautilus funding) or `overlays.DatedContract` (futures, FX
+  forwards); strategies trade them with `rebalance_overlays({symbol: notional fraction of NAV})`.
+* Research specs: implement a `domain.spec.Decider` and run the same `ResearchSpec` in
+  `paper.PaperEngine` and in the event engine through `SpecStrategy`.

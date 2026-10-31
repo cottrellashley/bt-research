@@ -33,4 +33,27 @@ class FixedIncomeCashflowModule(SimulationModule):
         return None
 
 
-__all__ = ["FixedIncomeCashflowModule"]
+class MarginVenueModule(SimulationModule):
+    """Applies the ledger's queued margin-account adjustments (collateral transfers, borrow fees)."""
+
+    def __init__(self, link) -> None:
+        super().__init__()
+        self.link = link
+
+    def pre_process(self, data) -> None:
+        return None
+
+    def process(self, ts_now: int, context):
+        return self.link.take_margin_adjustments()
+
+    def acknowledge(self, outcomes) -> None:
+        return None
+
+    def log_diagnostics(self) -> None:
+        return None
+
+    def reset(self) -> None:
+        return None
+
+
+__all__ = ["FixedIncomeCashflowModule", "MarginVenueModule"]

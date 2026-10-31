@@ -8,6 +8,7 @@ becomes available. There is deliberately no handle back to the environment or th
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
@@ -65,23 +66,27 @@ class CashState:
         return self.settled + self.unsettled_receivable - self.unsettled_payable - self.reserved
 
 
+_BUILTIN_KINDS = frozenset({"mark", "liquidity", "rating", "fixing", "curve", "factor", "index_ratio", "action", "stress", "fx"})
+
+
 class DecisionContext:
     """Point-in-time view handed to strategies. All state is pushed by the engine; reads are restricted."""
 
-    def __init__(self, actor: str, vintage: DataVintage, support: SupportMatrix | None = None, approved_models: dict[str, str] | None = None, base_currency: str = "USD", run_mode: str = "HISTORICAL_REPLAY") -> None:
+    def __init__(self, actor: str, vintage: DataVintage, support: SupportMatrix | None = None, approved_models: dict[str, str] | None = None, base_currency: str = "USD", run_mode: str = "HISTORICAL_REPLAY", max_history: int | None = 520) -> None:
         self.actor = actor
         self.vintage = vintage
         self.support = support or SupportMatrix()
         self.approved_models = dict(approved_models or {})
         self.base_currency = base_currency
         self.run_mode = run_mode
+        self.max_history = max_history                  # observations kept per instrument / index (None = unbounded)
         self._now_ns: int = 0
         self._marks: dict[str, Any] = {}
-        self._mark_history: dict[str, list[Any]] = {}
+        self._mark_history: dict[str, deque] = {}
         self._liquidity: dict[str, Any] = {}
         self._ratings: dict[str, int] = {}
         self._fixings: dict[str, tuple[int, float]] = {}
-        self._fixing_history: dict[str, list[tuple[int, float]]] = {}
+        self._fixing_history: dict[str, deque] = {}
         self._curves: dict[str, Any] = {}
         self._factors: dict[str, float] = {}
         self._index_ratios: dict[str, float] = {}
@@ -97,6 +102,9 @@ class DecisionContext:
         self._nav: float | None = None
         self._funding_shortfall: float = 0.0
         self._restricted: set[str] = set()
+        self._fields: dict[str, dict[str, Any]] = {}
+        self._rows: dict[str, tuple] = {}
+        self._field_ts: dict[str, int] = {}
         self.log: list[str] = []
 
     # ------------------------------------------------------------------ engine-side updates
@@ -110,14 +118,20 @@ class DecisionContext:
             raise InformationBoundaryError(f"{kind} {key} published to the context before it is available ({available_ns} > {self._now_ns})")
         if kind == "mark":
             self._marks[key] = value
-            self._mark_history.setdefault(key, []).append(value)
+            h = self._mark_history.get(key)
+            if h is None:
+                h = self._mark_history[key] = deque(maxlen=self.max_history)
+            h.append(value)
         elif kind == "liquidity":
             self._liquidity[key] = value
         elif kind == "rating":
             self._ratings[key] = int(value)
         elif kind == "fixing":
             self._fixings[key] = (available_ns, float(value))
-            self._fixing_history.setdefault(key, []).append((available_ns, float(value)))
+            h = self._fixing_history.get(key)
+            if h is None:
+                h = self._fixing_history[key] = deque(maxlen=self.max_history)
+            h.append((available_ns, float(value)))
         elif kind == "curve":
             self._curves[key] = value
         elif kind == "factor":
@@ -130,8 +144,49 @@ class DecisionContext:
             self._stress = float(value)
         elif kind == "fx":
             self._fx[key] = float(value)
+        else:                                            # any other kind is a generic field (signal, vendor analytic, index weight ...)
+            self._materialise(kind)
+            self._rows.pop(kind, None)
+            self._fields.setdefault(kind, {})[key] = value
+
+    def _publish_row(self, field: str, ids, values, available_ns: int) -> None:
+        """Publish a cross-section by reference (an id index and an aligned value array): O(1) per
+        field per day; dictionaries are only built when a strategy reads the field."""
+        if available_ns > self._now_ns:
+            raise InformationBoundaryError(f"field {field} published to the context before it is available ({available_ns} > {self._now_ns})")
+        self._rows[field] = (ids, values)
+        self._fields.pop(field, None)
+        self._field_ts[field] = available_ns
+
+    def _materialise(self, name: str) -> dict[str, Any]:
+        if name in self._rows and name not in self._fields:
+            import numpy as np
+
+            ids, vals = self._rows[name]
+            ok = np.isfinite(vals)
+            self._fields[name] = dict(zip(ids[ok], vals[ok].tolist()))
+        return self._fields.get(name, {})
+
+    def field_row(self, name: str):
+        """(ids, values) of a field published by reference, or None."""
+        return self._rows.get(name)
+
+    def _publish_slice(self, field: str, values: dict[str, Any], available_ns: int, replace: bool = True) -> None:
+        """Publish a whole cross-section of a generic field at once (one call per field per day)."""
+        if available_ns > self._now_ns:
+            raise InformationBoundaryError(f"field {field} published to the context before it is available ({available_ns} > {self._now_ns})")
+        if field in _BUILTIN_KINDS:
+            for k, v in values.items():
+                self._publish(field, k, v, available_ns)
+            return
+        if not replace:
+            self._materialise(field)
+        self._rows.pop(field, None)
+        if replace:
+            self._fields[field] = dict(values)
         else:
-            raise KeyError(kind)
+            self._fields.setdefault(field, {}).update(values)
+        self._field_ts[field] = available_ns
 
     def _set_portfolio(self, positions: dict[str, VisiblePosition], orders: dict[str, VisibleOrder], cash: dict[str, CashState], nav: float | None) -> None:
         self._positions, self._orders, self._cash, self._nav = dict(positions), dict(orders), dict(cash), nav
@@ -162,8 +217,8 @@ class DecisionContext:
         return self._marks.get(instrument)
 
     def mark_history(self, instrument: str, n: int | None = None) -> list:
-        h = self._mark_history.get(instrument, [])
-        return h[-n:] if n else list(h)
+        h = list(self._mark_history.get(instrument, ()))
+        return h[-n:] if n else h
 
     def liquidity(self, instrument: str):
         return self._liquidity.get(instrument)
@@ -230,6 +285,29 @@ class DecisionContext:
         if self._tradable_fn:
             return self._tradable_fn(instrument, self.today)
         return True, "ok"
+
+    # ------------------------------------------------------------------ generic fields
+    def field(self, name: str, key: str, default: Any = None) -> Any:
+        """Latest published value of a generic field for one entity (instrument, index, curve ...)."""
+        return self._materialise(name).get(key, default)
+
+    def field_slice(self, name: str) -> dict[str, Any]:
+        """The latest published cross-section of a generic field."""
+        return dict(self._materialise(name))
+
+    def field_names(self) -> list[str]:
+        return sorted(set(self._fields) | set(self._rows))
+
+    def field_time(self, name: str) -> int | None:
+        return self._field_ts.get(name)
+
+    def panel(self, names: list[str], keys: list[str] | None = None):
+        """Cross-section of several generic fields as a DataFrame (rows: entities, columns: fields)."""
+        import pandas as pd
+
+        cols = {n: self._materialise(n) for n in names}
+        idx = keys if keys is not None else sorted(set().union(*[set(v) for v in cols.values()])) if cols else []
+        return pd.DataFrame({n: [v.get(k) for k in idx] for n, v in cols.items()}, index=idx, dtype=float)
 
     def support_status(self, product_family: str, feature: str) -> Capability:
         return self.support.status(product_family, feature, run_mode=self.run_mode)

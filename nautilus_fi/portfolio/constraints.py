@@ -85,13 +85,19 @@ class ConstraintSet:
         if c.minimum is not None and value < c.minimum - 1e-12:
             out.append(Violation(c, group, value, c.minimum, "HARD" if c.hard else "SOFT"))
 
-    def evaluate(self, rows: pd.DataFrame, nav: float, turnover: float = 0.0, cash: float = 0.0, benchmark_weights: dict[str, float] | None = None) -> list[Violation]:
+    def evaluate(self, rows: pd.DataFrame, nav: float, turnover: float = 0.0, cash: float = 0.0, benchmark_weights: dict[str, float] | None = None, benchmark_rows: pd.DataFrame | None = None) -> list[Violation]:
         """``rows``: one row per position with columns weight (signed MV/NAV), issuer, sector, country,
-        currency, rating_bucket, rating_score, seniority, duration, spread_duration, dts, liquidity_rank, krd_<tenor>..."""
+        currency, rating_bucket, rating_score, seniority, duration, spread_duration, dts, liquidity_rank, krd_<tenor>...
+
+        ``benchmark_rows`` (same columns, benchmark weights) drive BENCHMARK_BAND (active weight per
+        ``group_col`` value) and ``scope="active"`` exposure constraints (portfolio minus benchmark
+        duration / spread duration / DTS / key rate). ``benchmark_weights`` may instead give group
+        weights directly. ``turnover`` is this rebalance's turnover under the run's definition."""
         out: list[Violation] = []
         if rows is None:
             rows = pd.DataFrame()
         w = rows["weight"] if "weight" in rows else pd.Series(dtype=float)
+        bw = benchmark_rows["weight"] if benchmark_rows is not None and "weight" in benchmark_rows else None
         for c in self.constraints:
             if c.kind == ConstraintKind.ISSUER_WEIGHT and "issuer" in rows:
                 for g, v in rows.groupby("issuer")["weight"].sum().items():
@@ -103,12 +109,18 @@ class ConstraintSet:
             elif c.kind == ConstraintKind.CONCENTRATION and len(w):
                 for sym, v in zip(rows.get("symbol", rows.index), w):
                     self._check(c, abs(v), str(sym), out)
-            elif c.kind in (ConstraintKind.DURATION, ConstraintKind.SPREAD_DURATION, ConstraintKind.DTS) and len(w):
+            elif c.kind in (ConstraintKind.DURATION, ConstraintKind.SPREAD_DURATION, ConstraintKind.DTS) and (len(w) or c.scope == "active"):
                 col = {"DURATION": "duration", "SPREAD_DURATION": "spread_duration", "DTS": "dts"}[c.kind.value]
-                if col in rows:
-                    self._check(c, float((w * rows[col].fillna(0.0)).sum()), None, out)
+                if col in rows or (c.scope == "active" and benchmark_rows is not None):
+                    val = float((w * rows[col].fillna(0.0)).sum()) if col in rows and len(w) else 0.0
+                    if c.scope == "active" and bw is not None and col in benchmark_rows:
+                        val -= float((bw * benchmark_rows[col].fillna(0.0)).sum())
+                    self._check(c, val, "active" if c.scope == "active" else None, out)
             elif c.kind == ConstraintKind.KEY_RATE and c.group_col in rows:
-                self._check(c, float((w * rows[c.group_col].fillna(0.0)).sum()), c.group_col, out)
+                val = float((w * rows[c.group_col].fillna(0.0)).sum())
+                if c.scope == "active" and bw is not None and c.group_col in benchmark_rows:
+                    val -= float((bw * benchmark_rows[c.group_col].fillna(0.0)).sum())
+                self._check(c, val, c.group_col, out)
             elif c.kind == ConstraintKind.LEVERAGE and len(w):
                 self._check(c, float(w.abs().sum()), None, out)
             elif c.kind == ConstraintKind.TURNOVER:
@@ -124,9 +136,14 @@ class ConstraintSet:
                 self._check(c, share, f"rank<={c.group_value}", out)
             elif c.kind == ConstraintKind.SENIORITY and "seniority" in rows and c.group_value is not None:
                 self._check(c, float(w[rows["seniority"] == c.group_value].sum()), c.group_value, out)
-            elif c.kind == ConstraintKind.BENCHMARK_BAND and benchmark_weights and c.group_col in rows:
-                for g, v in rows.groupby(c.group_col)["weight"].sum().items():
-                    self._check(c, v - benchmark_weights.get(str(g), 0.0), str(g), out)
+            elif c.kind == ConstraintKind.BENCHMARK_BAND and c.group_col and (benchmark_weights or (benchmark_rows is not None and c.group_col in benchmark_rows)):
+                port = rows.groupby(c.group_col)["weight"].sum() if (c.group_col in rows and len(w)) else pd.Series(dtype=float)
+                bench = benchmark_rows.groupby(c.group_col)["weight"].sum() if (benchmark_rows is not None and c.group_col in benchmark_rows) else pd.Series(benchmark_weights or {}, dtype=float)
+                port.index = port.index.astype(str)
+                bench.index = bench.index.astype(str)
+                for g in sorted(set(port.index) | set(bench.index)):
+                    if c.group_value is None or g == c.group_value:
+                        self._check(c, float(port.get(g, 0.0) - bench.get(g, 0.0)), g, out)
             elif c.kind == ConstraintKind.RESTRICTED and "symbol" in rows and c.group_value is not None:
                 for sym, v in zip(rows["symbol"], w):
                     if sym == c.group_value and abs(v) > 1e-12:

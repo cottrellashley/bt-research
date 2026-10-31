@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nautilus-fi"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fixed income backtesting platform on Nautilus Trader v2: point-in-time data, marks vs fills, dated settlement, ledger of record, funding, structured deals, manifests"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
@@ -15,14 +15,20 @@ dependencies = [
     "pandas>=2.1",
     "pyarrow>=15",
     "tabulate>=0.9",
+    "scipy>=1.11",
+    "highspy>=1.7",
 ]
 
 [project.optional-dependencies]
 quantlib = ["QuantLib>=1.33"]
+snowflake = ["snowflake-connector-python>=3.6", "cryptography>=42"]
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [tool.setuptools.packages.find]
 include = ["nautilus_fi*"]
+
+[tool.setuptools.package-data]
+"nautilus_fi.data.loaders" = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

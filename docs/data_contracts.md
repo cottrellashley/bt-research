@@ -25,6 +25,24 @@ The manifest records each dataset's row count, content hash, knowledge time and 
 | `stress` | `with_stress` | date, value | name, publish_ts | CDX / index OAS / VIX normalised (0 calm, ~1 March 2020) |
 | `benchmark` | `with_benchmark` | date, total_return | name, duration, oas | index vendors |
 | new issues | `with_new_issues` | `NewIssueTerms` per symbol | reoffer price, allocation fraction, issue date | syndicate data |
+| `analytics` | `with_analytics(df, source)` | date, instrument_id | oas_bp (or z_spread_bp), oad (or mod_duration), oasd (or spread_duration), ytm, ytw, convexity, dv01, wal, krd_<tenor>, publish_ts | vendor analytics (BVAL, ICE, Bloomberg index analytics) |
+| `fields` | `with_fields(df, fields, lags)` | date, instrument_id, one column per field | publish_ts | signals, vendor total / excess returns, any per-bond series published to strategies |
+| `benchmark_constituents` | `with_benchmark_constituents(df, name, drift)` | date (reconstitution), instrument_id, weight | benchmark | index vendor constituents; weights drift or stay static between reconstitutions |
+| `supplied_cashflows` | `with_supplied_cashflows` | symbol, pay_date | interest_per_100, principal_per_100, source | coupon schedules for terms-free bonds (paid like deal-waterfall allocations) |
+
+Reference rows may set `terms_source = VENDOR` (terms-free): `issue_date` may then be empty, vendor
+accrued must be supplied (`evaluated_prices.accrued`), coupons come from `supplied_cashflows`, and
+analytics from `analytics`; dependency validation refuses (strict) or excludes (lenient) terms-free
+bonds missing either.
+
+Evaluated prices published after the mark publication time of their date are used from the first
+trading day whose publication time follows them (an evaluation one day old), never on their own date.
+
+The panel engine takes panels (`nautilus_fi.data.panel.Panel`: one dates x instruments matrix per
+field) built with `Panel.from_long` or read from the `FieldStore` (`panel(fields, as_of=...)`): at
+minimum `tr` (total return of the period ending on the date) and, for the other features, `alive`,
+`xr`, `tsy_r`, `half_spread_bp`, `price_clean`, `oad`, `oasd`, `dts`, `krd_*`, `rating_score`, signals.
+A field's `availability_lag_days` (trading days) controls what a decision on a date may use.
 
 Maturities are generated automatically for every bond maturing inside the window unless an explicit
 action exists. Dependency validation refuses (strict mode) or excludes (lenient mode) instruments

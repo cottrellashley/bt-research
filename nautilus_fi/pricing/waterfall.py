@@ -48,7 +48,7 @@ class EvaluatedObs:
     source: str = "EVALUATED"
 
 
-@dataclass
+@dataclass(slots=True)                                   # one per bond-day: slots halve the memory
 class MarkResult:
     clean_mid: float
     clean_bid: float

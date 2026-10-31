@@ -41,9 +41,12 @@ class FixedIncomeEnvironmentActor(DataActor):
         super().__init__(DataActorConfig(log_events=False, log_commands=False))
         self.ctx = ctx
         self._published: set = set()
+        self._sovereign_names = {c.name for c in ctx.env.curves.values()} | {ctx.env.curve_name}
 
     def on_start(self) -> None:
         self.ctx.fill_model.clock = self.clock
+        if self.ctx.overlay_fill_model is not None:
+            self.ctx.overlay_fill_model.clock = self.clock
         for cls in (BondMark, LiquiditySnapshot, RatingUpdate, IndexFixing, FactorUpdate, CorporateAction, StressIndex):
             self.subscribe_data(DataType(cls.__name__))
         self.subscribe_data(DataType("YieldCurve"))
@@ -84,7 +87,8 @@ class FixedIncomeEnvironmentActor(DataActor):
         elif name == "YieldCurve":
             curve = ZeroCurve(dc.today, list(payload.tenors), list(payload.interest_rates), payload.curve_name)
             dc._publish("curve", payload.curve_name, curve, ts)
-            dc._publish("curve", "GOVT", curve, ts)
+            if payload.curve_name in self._sovereign_names:          # only the sovereign curve answers to GOVT
+                dc._publish("curve", "GOVT", curve, ts)
 
     # ------------------------------------------------------------------ timers
     def on_time_event(self, event) -> None:
@@ -93,9 +97,29 @@ class FixedIncomeEnvironmentActor(DataActor):
             dc._set_now(event.ts_event)
         d = pd.Timestamp(event.ts_event, tz="UTC").date()
         if event.name == self.REFRESH_TIMER:
+            self._publish_fields(d)
             self._refresh_portfolio(d)
         elif event.name == self.SNAPSHOT_TIMER:
             self._publish_snapshot(event, d)
+
+    def _publish_fields(self, d) -> None:
+        """Generic fields reach the context as whole cross-sections, by reference, once per day: the
+        row known at this decision time (the field's availability lag in trading days applied)."""
+        panel = self.ctx.env.field_panel
+        if panel is None or not panel.fields:
+            return
+        i = panel.date_pos(d)
+        if i < 0:
+            return
+        sched = self.ctx.env.schedule
+        dc = self.ctx.decision
+        for name in panel.fields:
+            j = i - panel.lags.get(name, 0)
+            if j < 0:
+                continue
+            avail = sched.publish_ns(panel.dates[j].date())
+            if avail <= dc.now_ns:
+                dc._publish_row(name, panel.ids, panel.values[name][j], avail)
 
     def _refresh_portfolio(self, d) -> None:
         ledger = self.ctx.ledger
@@ -125,6 +149,15 @@ class FixedIncomeEnvironmentActor(DataActor):
             cash[ccy] = CashState(ccy, s["settled"], s["unsettled_receivable"], s["unsettled_payable"], s["reserved"], s["collateral_posted"])
         nav = float(ledger.snapshots[-1]["nav"]) if ledger.snapshots else ledger.ledger.nav(ledger._fx(d)).amount
         self.ctx.decision._set_portfolio(positions, orders, cash, nav)
+        if ledger.funding_policy.repo_for_leverage:
+            self.ctx.decision._publish_slice("funding.repo_capacity", {self.ctx.base_currency: float(ledger.repo_capacity_cached)}, self.ctx.decision.now_ns)
+        link = ledger.margin
+        if link is not None:
+            now = self.ctx.decision.now_ns
+            book = link.s.book
+            self.ctx.decision._publish_slice("overlay.units", link.units(), now)
+            self.ctx.decision._publish_slice("overlay.price", {k: v for k in book.contracts if (v := book.price(k, d)) is not None}, now)
+            self.ctx.decision._publish_slice("overlay.margin", {k: float(v) for k, v in link.last.items()}, now)
         self.ctx.decision._set_funding(ledger.funding_shortfall)
 
     def _publish_snapshot(self, event, d) -> None:

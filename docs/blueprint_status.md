@@ -27,28 +27,39 @@ does not call it yet. Statuses follow the support matrix vocabulary.
 | TBA delivery and dollar rolls | APPROXIMATION, module | `structured.tba` | not wired to the ledger |
 | Deal waterfall (OC / IC, reinvestment, sequential / pro-rata, equity), tranche payments | APPROXIMATION, wired | `structured.*`, `synthetic.generator`, `accounting.ledger` | CLO / ABS / CMBS deals run through the internal engine; deferred tranche interest is reported, not capitalised |
 | External deal engines (Intex) | EXPERIMENTAL | `structured.engine.ExternalEngineAdapter` | adapter contract only |
-| Treasury futures, IRS, CDS, FX forwards | APPROXIMATION, module | `instruments.derivatives`, `accounting.postings` | valuation and margin / VM postings exist; not tradable inside the Nautilus venue (needs a margin venue) |
+| Treasury futures, IRS, CDS, FX forwards | APPROXIMATION, wired | `instruments.derivatives`, `overlays`, `accounting.margin` | tradable on the margin venue: futures and FX forwards as dated contracts, CDX / TRS / carry instruments as financed contracts (daily funding); collateral booked in the ledger and moved between venues by rule |
 | FX conversion and translation | VALIDATED, wired | `accounting.ledger._fx_fund`, `instruments.fx` | spot conversion through the translation account; hedge programs are a module |
-| Repo, securities lending, margin | APPROXIMATION | `funding.repo`, `funding.borrow`, `funding.margin`, `accounting.ledger` | funding repo under the breach ladder is wired; strategy-driven repo / shorts are modules with hooks (`borrow_available`) |
+| Repo, securities lending, margin | APPROXIMATION, wired | `funding.repo`, `funding.borrow`, `funding.margin`, `accounting.ledger`, `accounting.margin` | repo-financed leverage (`FundingPolicy(repo_for_leverage=True)`) and the funding ladder are wired; shorts trade as synthetic bond TRS on the margin venue with borrow fees; securities lending recall remains a module |
 | Funding policy: settle before spend, bridge, breach ladder | VALIDATED, wired | `funding.policy`, `funding.cash`, `accounting.ledger._process_funding` | hold buys -> repo -> liquidate by rule -> declare failure |
 | Marks: four values, evidence classes, lineage, stale roll | VALIDATED, wired | `pricing.marks`, `pricing.waterfall`, `pricing.stale_roll` | evidence shares in results and bundles |
 | Calibration recipes with explicit status | VALIDATED, wired | `market.calibration`, `MarketEnvironment.curve` | STALE / FAILED recorded per date |
 | Pricing engines (discounting, Hull-White trinomial for callables) | VALIDATED / EXPERIMENTAL | `pricing.engine`, `pricing.quantlib_adapter` | HW tree is 0.1; exercise in replay comes from realized call actions |
 | Execution process (RFQ panel, voice, portfolio trades, liquidity budget, cost decomposition) | APPROXIMATION, wired | `execution.process`, `execution.fill_model` | scenario parameters until calibrated on own order history |
 | Prior-close reference, window-time liquidity | VALIDATED, wired | `MarketEnvironment.reference`, `data.trace.daily_liquidity_stats` | |
-| Portfolio construction, constraints, forced actions, risk | VALIDATED, wired | `portfolio.*`, `backtest.strategy` | constraints are typed; soft violations logged |
+| Portfolio construction, constraints, forced actions, risk | VALIDATED, wired | `portfolio.*`, `backtest.strategy` | new buys are checked, turnover budgets scale trades, benchmark bands / active exposures evaluated, every pre / post violation and relaxation logged in `result.construction`; index-removal forced sales fire from published membership |
 | Attribution and returns | VALIDATED, module + partial wiring | `accounting.attribution`, `accounting.returns`, `result.attribution()` | result attribution is income / execution / price; the full decomposition is a module |
-| Research: walk-forward with purging, bootstrap, Newey-West, deflated Sharpe, PBO, stress | VALIDATED, module | `research.*` | call around `FixedIncomeBacktest`; not automated inside the builder |
+| Research: walk-forward with purging, bootstrap, Newey-West, deflated Sharpe, PBO, stress | VALIDATED, wired | `research.*`, `governance.*` | every Paper / Implement / Evaluate run can record itself in the trial ledger; DSR and PBO come from it; walk-forward orchestration with trading-day purge / embargo |
 | Invariants | VALIDATED, partly wired | `validation.invariants`, `result.invariants()` | conservation, payments reconcile, unfilled orders run in results; temporal isolation, duplicate delivery, lot regrouping, pinned replay, failed settlement are suites to call in tests |
 | Reports: bundle, explain order / payment, unknowns | VALIDATED, wired | `reports.bundle`, `result.bundle()` | |
 | Corrections / restatement bridge | VALIDATED, module | `lifecycle.corrections` | environment rebuild on restatement is manual |
+| Panel engine, signal evaluation | VALIDATED, wired | `paper.*` | lags, costs, leverage, shorts, overlays, missing-return policies; replication and oracle tests |
+| Conventions registry and calendars | VALIDATED, wired | `domain.conventions`, `domain.calendars` | recorded in manifests, ledger and records; legacy profiles marked unconfirmed until golden outputs |
+| Benchmarks as objects | VALIDATED, wired | `benchmarks.*`, `MarketEnvironmentBuilder.with_benchmark_constituents` | constituents, drift / static, custom caps and subsets, composites |
+| Optimiser and constraint grammar | VALIDATED, wired | `construct.*` | LP / MILP / QP / CVaR on HiGHS; `lp_round` for large mixed-integer problems |
+| Vendor analytics and generic fields | VALIDATED, wired | `MarketEnvironmentBuilder.with_analytics / with_fields`, `core.context` | source policy with COMPARE discrepancies; fields published to strategies by reference |
+| Terms-free instruments | APPROXIMATION, wired | `instruments.bond.terms_source`, `accounting.ledger` | vendor accrued and supplied cashflows; no matrix pricing or stale roll without terms |
+| Paper / Implement reconciliation | VALIDATED, wired | `paper.reconcile` | holdings gap, cash, execution, residual |
+| Trade proposals, OMS / PORT files | APPROXIMATION, wired | `propose.*` | layouts are column maps to confirm against each system |
+| Data loaders | APPROXIMATION, wired | `data.loaders.*` | SQL / Snowflake / files; the FIAtlas catalogue is a template |
+| Streamed replay, deterministic hashes | VALIDATED, wired | `BacktestSettings.stream_days`, `accounting.ledger` | streamed and one-shot runs hash identically |
 
 ## Not built
 
 * Stochastic simulation run mode; auction / reopening events; covenants; municipal extraordinary
   redemptions; convertibles.
-* A margin venue for exchange-traded and OTC derivatives inside Nautilus (valuation exists).
-* Vendor adapters (BVAL / ICE / TRACE / Intex loaders): the data contracts are defined, the loaders
-  are the user's.
+* Vendor-specific mappings: the loader framework, the Snowflake connection and a FIAtlas catalogue
+  template exist; pointing them at the deployed BVAL / ICE / TRACE / index tables is configuration.
+* Golden-output parity with the legacy frameworks: their conventions are encoded as profiles; matching
+  their numbers needs their outputs.
 * Calibration of the execution process on the desk's own RFQ / TRACE history: hooks and scenario
   defaults exist, the fitted model does not.

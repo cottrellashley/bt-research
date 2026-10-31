@@ -33,7 +33,7 @@ from nautilus_fi.instruments.enums import CouponType, DayCount, Frequency
 BP = 1e-4
 
 
-@dataclass
+@dataclass(slots=True)                                   # one per bond-day: slots halve the memory
 class BondAnalytics:
     settle: date
     clean_price: float

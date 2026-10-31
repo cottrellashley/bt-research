@@ -173,6 +173,8 @@ class ExperimentManifest:
     support: list[dict] = field(default_factory=list)
     counterfactual: CounterfactualSpec | None = None
     seeds: dict[str, int] = field(default_factory=dict)
+    conventions: dict = field(default_factory=dict)                 # domain.conventions.Conventions.to_dict()
+    spec: dict = field(default_factory=dict)                        # research spec summary and hash when run from a spec
     code_version: str | None = field(default_factory=git_sha)
     environment: dict = field(default_factory=capture_environment)
     owner: str = ""

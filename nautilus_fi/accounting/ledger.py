@@ -147,6 +147,20 @@ class FixedIncomeLedger:
         self._repo_id = "REPO-FUNDING"
         self._fx_converted: set[tuple[str, date]] = set()
         self._today: date | None = None
+        # lifecycle work is done for active symbols only (held, traded today, or owed a payment);
+        # symbols skipped while inactive are caught up on their next active day
+        self._last_processed: dict[str, date] = {}
+        self._unpaid: dict[str, set[date]] = {}
+        self._today_units: dict[str, float] = {}
+        self._today_date: date | None = None
+        self._rank: dict[str, int] | None = None
+        self._tranche_lists: dict[str, list[tuple[date, float, float]]] | None = None
+        self._tranche_ent_cursor: dict[str, int] = {}
+        self._tranche_pay_cursor: dict[str, int] = {}
+        self.order_scan = "incremental"                # incremental: orders the fill model saw + expirations; full: every order
+        self.margin = None                             # accounting.margin.MarginLink when the run has a margin venue
+        self.repo_capacity_cached = 0.0                # repo obtainable against eligible holdings at the last snapshot
+        self.holdings_frequency = "D"                  # D | M (month ends) | END | NONE: what holdings_history keeps
 
     # ------------------------------------------------------------------ binding
     def bind(self, cache, venue) -> None:
@@ -181,6 +195,8 @@ class FixedIncomeLedger:
         """Spendable cash for the fill model's funding gate: settled minus reserved plus policy bridge,
         plus base-currency cash convertible at spot when the policy allows FX conversion."""
         avail = self.cash_view.available(currency, self.funding_policy.bridge_allowance() if currency == self.base else 0.0)
+        if currency == self.base and self.funding_policy.repo_for_leverage:
+            avail += self.repo_capacity_cached                                      # financed leverage: repo drawn when the buys settle
         if currency != self.base and self.funding_policy.allow_fx_conversion:
             fx = self.env.fx(currency, self._today or self.env.start_date) or 1.0
             avail += max(self.cash_view.available(self.base), 0.0) / fx
@@ -190,10 +206,13 @@ class FixedIncomeLedger:
         rec, pay = self.queue.unsettled_cash(self.base)
         return rec - pay
 
-    def _holder_accrued_per_100(self, bond: BondSpec, settle: date, inputs, rule) -> float:
+    def _holder_accrued_per_100(self, bond: BondSpec, settle: date, inputs, rule, trade_date: date | None = None) -> float:
         """Accrued per 100 current face carried by a holder whose trade settles on ``settle``: the
         contractual accrual of the period containing ``settle``; negative inside an ex-coupon period
-        (gilt style), where the registered holder keeps the whole coupon and the buyer is compensated."""
+        (gilt style), where the registered holder keeps the whole coupon and the buyer is compensated.
+        Terms-free bonds carry the vendor's accrued for the trade date."""
+        if bond.terms_free:
+            return self.env.accrued(bond.symbol, trade_date or settle)
         if bond.coupon_type == CouponType.ZERO:
             return 0.0
         base = accrued_interest(bond, settle, inputs)
@@ -220,16 +239,65 @@ class FixedIncomeLedger:
             bond = self._bond(pos.instrument_id)
             if bond is not None:
                 held[bond.symbol] = _num(pos.signed_qty)
-        today: dict[str, float] = {}
-        for f in self.fills:
-            if f.date == d and f.protocol != "EXPIRATION":
-                today[f.symbol] = today.get(f.symbol, 0.0) + (f.orig_face if f.side == "BUY" else -f.orig_face) / 100.0
-        return held, today
+        return held, (dict(self._today_units) if self._today_date == d else {})
+
+    def _active_symbols(self, d: date, held: dict[str, float], today: dict[str, float]) -> list[str]:
+        if self._rank is None:
+            self._rank = {s: i for i, s in enumerate(self.env.bonds)}
+        act = {s for s, u in held.items() if abs(u) > 0} | set(today)
+        for s, pays in self._unpaid.items():
+            if pays and min(pays) <= d:
+                act.add(s)
+        return sorted((s for s in act if s in self._rank), key=self._rank.__getitem__)
+
+    def _tranche_list(self, symbol: str) -> list[tuple[date, float, float]]:
+        if self._tranche_lists is None or sum(len(v) for v in self._tranche_lists.values()) != len(self.env.tranche_payments):
+            lists: dict[str, list[tuple[date, float, float]]] = {}
+            for (sym, pay), (ipp, ppp) in self.env.tranche_payments.items():
+                lists.setdefault(sym, []).append((pay, ipp, ppp))
+            self._tranche_lists = {k: sorted(v) for k, v in lists.items()}
+        return self._tranche_lists.get(symbol, [])
+
+    def _catch_up(self, symbol: str, d: date) -> None:
+        """A symbol skipped while inactive held nothing and was owed nothing on the skipped days:
+        coupons that crystallised then belong to no one here, and its factor restarts from the
+        previous trading day. Equivalent to processing it every day, at the cost of active days only."""
+        last = self._last_processed.get(symbol)
+        if last == d:
+            return
+        self._last_processed[symbol] = d
+        prev = self.env.prev_trading_date(d)
+        if prev is None or (last is not None and last >= prev):      # processed since the previous trading day (weekends included)
+            return
+        bond = self.env.bonds[symbol]
+        rule = self.env.entitlement_rule(bond)
+        settle_prev = self.env.settle_date(bond, prev)
+        if self.env.is_structured(symbol):
+            pays = self._tranche_list(symbol)
+            i = self._tranche_ent_cursor.get(symbol, 0)
+            while i < len(pays) and self._entitlement_triggered(bond, rule, settle_prev, pays[i][0]):
+                key = (symbol, pays[i][0])
+                if pays[i][0] >= self.env.start_date and key not in self._entitled:
+                    self._entitled[key] = (0.0, pays[i][2], 0.0)
+                i += 1
+            self._tranche_ent_cursor[symbol] = i
+        elif bond.coupon_type != CouponType.ZERO and bond.issue_date <= prev:
+            sched = bond.schedule
+            i = self._entitlement_cursor.get(symbol, 0)
+            while i < len(sched) and self._entitlement_triggered(bond, rule, settle_prev, sched[i].payment_date):
+                key = (symbol, sched[i].payment_date)
+                if sched[i].payment_date >= self.env.start_date and key not in self._entitled:
+                    self._entitled[key] = (0.0, 0.0, 0.0)
+                i += 1
+            self._entitlement_cursor[symbol] = i
+        if bond.principal_type in (PrincipalType.AMORTIZING, PrincipalType.SINKING):
+            self._factor_applied[symbol] = self.env.factor(symbol, prev)
 
     def _book_entitlement(self, ts_now: int, d: date, bond: BondSpec, payment_date: date, interest_cash: float, principal_per_100: float, face_orig: float, source: str) -> None:
         key = (bond.symbol, payment_date)
         self._entitled[key] = (interest_cash, principal_per_100, face_orig)
         if interest_cash > 1e-9:
+            self._unpaid.setdefault(bond.symbol, set()).add(payment_date)
             ev = self._event(EventType.COUPON_ENTITLEMENT, ts_now, bond.symbol, {"amount": interest_cash, "payment_date": payment_date.isoformat(), "face": face_orig, "source": source})
             self.policy.coupon_entitlement(ev.id, ts_now, bond.symbol, bond.currency, interest_cash)
 
@@ -246,15 +314,23 @@ class FixedIncomeLedger:
             self._holdings_by_date[d] = {self._bond(p.instrument_id).symbol: _num(p.signed_qty) for p in positions if self._bond(p.instrument_id) is not None}
             for old in [k for k in self._holdings_by_date if (d - k).days > 45]:
                 self._holdings_by_date.pop(old, None)
+        if self.margin is not None:
+            adjustments += self.margin.take_otc_adjustments()
         self._process_settlements(ts_now, d)
         adjustments += self._process_new_fills(ts_now, d)
         adjustments += self._process_cash_interest(ts_now, d)
-        self._process_entitlements(ts_now, d, positions)
+        held, today = self._held_and_today(d, positions)
+        active = self._active_symbols(d, held, today)
+        for sym in active:
+            self._catch_up(sym, d)
+        self._process_entitlements(ts_now, d, positions, held, today, active)
         self._process_daily_accrual(ts_now, d, positions)
-        adjustments += self._process_coupons_and_factors(ts_now, d, positions)
+        adjustments += self._process_coupons_and_factors(ts_now, d, positions, held, today, active)
         adjustments += self._process_actions(ts_now, d, positions)
         adjustments += self._process_funding(ts_now, d, positions)
         if self.env.schedule.is_publish(ts_now) and self._last_snapshot_date != d:
+            if self.margin is not None:
+                adjustments += self.margin.on_publish(ts_now, d, self.cash_view.available(self.base) - self.funding_policy.min_cash_buffer)
             self._mark_positions(ts_now, d, positions)
             self._snapshot(now, d, positions, adjustments)
         if self.fill_model is not None and self.env.schedule.is_publish(ts_now):
@@ -273,7 +349,7 @@ class FixedIncomeLedger:
         adjustments: list[Money] = []
         if self.cache is None:
             return adjustments
-        for order in self.cache.orders(None, None, None, None):
+        for order in self._candidate_orders(d):
             events = [e for e in order.events() if type(e).__name__ == "OrderFilled"]
             key = str(order.client_order_id)
             seen = self._seen_fill_counts.get(key, 0)
@@ -293,15 +369,18 @@ class FixedIncomeLedger:
                 orig_face = units_to_face(units)
                 face = orig_face * factor
                 is_expiration = any(str(t).startswith("EXPIRATION") for t in (order.tags or []))
+                # Nautilus names expiration orders with a random UUID: record a deterministic id so the
+                # event chain and output hashes reproduce run to run
+                rec_id = f"EXPIRATION-{bond.symbol}-{fill_date.isoformat()}" if is_expiration else key
                 settle = fill_date if is_expiration else self.env.settle_date(bond, fill_date)
                 defaulted = bond.symbol in self._defaulted and self._defaulted[bond.symbol] <= fill_date
                 inputs = self.env.market_inputs(bond.symbol, fill_date)
                 rule = self.env.entitlement_rule(bond)
-                accrued_per_100 = 0.0 if (is_expiration or defaulted) else self._holder_accrued_per_100(bond, settle, inputs, rule)
+                accrued_per_100 = 0.0 if (is_expiration or defaulted) else self._holder_accrued_per_100(bond, settle, inputs, rule, fill_date)
                 accrued_cash = accrued_per_100 * face / 100.0
                 sign = 1.0 if side == "BUY" else -1.0
                 ccy = bond.currency
-                trade_ev = self._event(EventType.TRADE, e.ts_event, bond.symbol, {"side": side, "face": face, "clean": clean, "accrued": accrued_cash, "settle": settle.isoformat(), "currency": ccy, "expiration": is_expiration}, EventSource.EXECUTION, observed=False, order_id=key)
+                trade_ev = self._event(EventType.TRADE, e.ts_event, bond.symbol, {"side": side, "face": face, "clean": clean, "accrued": accrued_cash, "settle": settle.isoformat(), "currency": ccy, "expiration": is_expiration}, EventSource.EXECUTION, observed=False, order_id=rec_id)
                 qty_signed = orig_face if side == "BUY" else -orig_face
                 held_before = self.policy.book.quantity(bond.symbol)
                 if defaulted and side == "SELL" and held_before > 1e-9:          # selling (or recovering) a claim, not a security
@@ -334,11 +413,52 @@ class FixedIncomeLedger:
                     self._cum_costs += spread_cost
                 outcome = self.fill_model.outcomes.get(key) if self.fill_model is not None else None
                 protocol = "EXPIRATION" if is_expiration else next((str(t).split("=", 1)[1] for t in (order.tags or []) if str(t).startswith("protocol=")), "RFQ")
-                self.fills.append(FillRecord(fill_ts, fill_date, bond.symbol, side, face, px, clean, factor, sign * accrued_cash, settle, decision_mid, fill_mid, delay_days, spread_cost, delay_cost, key, protocol, orig_face, ref[3] if ref else "", outcome.cost.total_bp if (outcome and outcome.cost) else 0.0, outcome.evidence.value if outcome else "", self.env.evidence(bond.symbol, fill_date).value if fill_mark else ""))
+                self.fills.append(FillRecord(fill_ts, fill_date, bond.symbol, side, face, px, clean, factor, sign * accrued_cash, settle, decision_mid, fill_mid, delay_days, spread_cost, delay_cost, rec_id, protocol, orig_face, ref[3] if ref else "", outcome.cost.total_bp if (outcome and outcome.cost) else 0.0, outcome.evidence.value if outcome else "", self.env.evidence(bond.symbol, fill_date).value if fill_mark else ""))
+                if not is_expiration:
+                    if self._today_date != fill_date:
+                        self._today_date, self._today_units = fill_date, {}
+                    self._today_units[bond.symbol] = self._today_units.get(bond.symbol, 0.0) + qty_signed / 100.0
                 if self.fill_model is not None and not is_expiration:
                     self.fill_model.on_fill(key, face)
             self._seen_fill_counts[key] = len(events)
         return adjustments
+
+    def _candidate_orders(self, d: date) -> list:
+        """Orders that can carry unseen fills: those the fill model evaluated since the last pass, plus
+        orders on instruments closed by a redemption today (expiration fills). ``order_scan="full"``
+        rescans every order (the reference behaviour, O(orders) per timestamp)."""
+        if self.order_scan == "full" or self.fill_model is None or not hasattr(self.fill_model, "touched"):
+            return list(self.cache.orders(None, None, None, None))
+        from nautilus_trader.model import ClientOrderId
+
+        out = []
+        seen: set[str] = set()
+        for oid in sorted(self.fill_model.touched):
+            o = self.cache.order(ClientOrderId(oid))
+            if o is not None:
+                out.append(o)
+                seen.add(oid)
+        self.fill_model.touched.clear()
+        for act in self.env.actions_effective(d):
+            if act.action in ("CALL", "PUT", "TENDER", "MATURITY", "RECOVERY") and act.symbol in self.env.bonds:
+                for o in self.cache.orders(None, self.env.bonds[act.symbol].instrument_id(self.venue.value if self.venue is not None else "OTC"), None, None):
+                    k = str(o.client_order_id)
+                    if k not in seen and any(str(t).startswith("EXPIRATION") for t in (o.tags or [])):
+                        out.append(o)
+                        seen.add(k)
+        return out
+
+    def unprocessed_fills(self) -> int:
+        """Fills present in the cache that the ledger never processed (should be zero)."""
+        if self.cache is None:
+            return 0
+        missing = 0
+        for o in self.cache.orders(None, None, None, None):
+            if self._bond(o.instrument_id) is None:
+                continue
+            n = sum(1 for e in o.events() if type(e).__name__ == "OrderFilled")
+            missing += max(n - self._seen_fill_counts.get(str(o.client_order_id), 0), 0)
+        return missing
 
     def _fx_fund(self, ts_now: int, d: date, ccy: str, cash_amount: float) -> list[Money]:
         """Foreign-currency trades: convert base cash at spot (recorded as an FX fixing event) so the
@@ -392,12 +512,17 @@ class FixedIncomeLedger:
         self._cum_income += interest
         return [Money(interest, self.currency)]
 
-    def _process_entitlements(self, ts_now: int, d: date, positions) -> None:
+    def _process_entitlements(self, ts_now: int, d: date, positions, held: dict[str, float] | None = None, today: dict[str, float] | None = None, active: list[str] | None = None) -> None:
         """Crystallise coupon entitlements: on the first trade date whose settlement no longer carries a
         coupon, the trade-date holder (start of day; today's buyers excluded) acquires a receivable for
         it and accrued interest of the completed period is released. Payment clears the receivable."""
-        held, today = self._held_and_today(d, positions)
-        for symbol, bond in self.env.bonds.items():
+        if held is None:
+            held, today = self._held_and_today(d, positions)
+            active = self._active_symbols(d, held, today)
+            for sym in active:
+                self._catch_up(sym, d)
+        for symbol in active:
+            bond = self.env.bonds[symbol]
             if bond.issue_date > d or bond.coupon_type == CouponType.ZERO:
                 continue
             rule = self.env.entitlement_rule(bond)
@@ -406,13 +531,18 @@ class FixedIncomeLedger:
             units_start = held.get(symbol, 0.0) - today.get(symbol, 0.0)
             face_orig = units_to_face(units_start)
             if self.env.is_structured(symbol):
-                for (sym, pay_date), (interest_per_100, principal_per_100) in self.env.tranche_payments.items():
-                    if sym != symbol or pay_date < self.env.start_date or (symbol, pay_date) in self._entitled or not self._entitlement_triggered(bond, rule, settle, pay_date):
+                pays = self._tranche_list(symbol)
+                i = self._tranche_ent_cursor.get(symbol, 0)
+                while i < len(pays) and self._entitlement_triggered(bond, rule, settle, pays[i][0]):
+                    pay_date, interest_per_100, principal_per_100 = pays[i]
+                    i += 1
+                    if pay_date < self.env.start_date or (symbol, pay_date) in self._entitled:
                         continue
                     if defaulted or abs(face_orig) < 1e-9:
                         self._entitled[(symbol, pay_date)] = (0.0, principal_per_100, 0.0)
                         continue
                     self._book_entitlement(ts_now, d, bond, pay_date, interest_per_100 * face_orig / 100.0, principal_per_100, face_orig, "DEAL_WATERFALL")
+                self._tranche_ent_cursor[symbol] = i
                 continue
             sched = bond.schedule
             i = self._entitlement_cursor.get(symbol, 0)
@@ -445,7 +575,7 @@ class FixedIncomeLedger:
             factor = self.env.factor(bond.symbol, d)
             face = units_to_face(units) * factor
             defaulted = bond.symbol in self._defaulted and self._defaulted[bond.symbol] <= d
-            target = 0.0 if defaulted else self._holder_accrued_per_100(bond, self.env.settle_date(bond, d), self.env.market_inputs(bond.symbol, d), self.env.entitlement_rule(bond)) * face / 100.0
+            target = 0.0 if defaulted else self._holder_accrued_per_100(bond, self.env.settle_date(bond, d), self.env.market_inputs(bond.symbol, d), self.env.entitlement_rule(bond), d) * face / 100.0
             self.policy.set_accrued(f"ACCRUAL-{bond.symbol}-{d.isoformat()}", ts_now, bond.symbol, bond.currency, target)
 
     # ------------------------------------------------------------------ coupons / paydowns
@@ -459,27 +589,43 @@ class FixedIncomeLedger:
             return units_to_face(snap[bond.symbol])
         return units_to_face(positions_units - today_delta_units)
 
-    def _process_coupons_and_factors(self, ts_now: int, d: date, positions) -> list[Money]:
+    def _process_coupons_and_factors(self, ts_now: int, d: date, positions, held: dict[str, float] | None = None, today: dict[str, float] | None = None, active: list[str] | None = None) -> list[Money]:
         """Payment date: pay what was entitled (receivable -> cash); deal-waterfall principal and factor
         paydowns reduce the position at the paydown price."""
         adjustments: list[Money] = []
-        held, today = self._held_and_today(d, positions)
-        for symbol, bond in self.env.bonds.items():
+        if held is None:
+            held, today = self._held_and_today(d, positions)
+            active = self._active_symbols(d, held, today)
+            for sym in active:
+                self._catch_up(sym, d)
+        for symbol in active:
+            bond = self.env.bonds[symbol]
             if bond.issue_date > d:
                 continue
             units_now = held.get(symbol, 0.0)
             defaulted = symbol in self._defaulted and self._defaulted[symbol] <= d
             ccy = Currency.from_str(bond.currency)
+            unpaid = self._unpaid.get(symbol)
             if self.env.is_structured(symbol):
-                for (sym, pay_date), (interest_per_100, principal_per_100) in self.env.tranche_payments.items():
-                    if sym != symbol or pay_date > d or (symbol, pay_date) in self._tranche_paid or pay_date < self.env.start_date:
+                pays = self._tranche_list(symbol)
+                i = self._tranche_pay_cursor.get(symbol, 0)
+                while i < len(pays) and pays[i][0] <= d:
+                    pay_date, interest_per_100, principal_per_100 = pays[i]
+                    i += 1
+                    if (symbol, pay_date) in self._tranche_paid or pay_date < self.env.start_date:
                         continue
                     self._tranche_paid.add((symbol, pay_date))
+                    if unpaid is not None:
+                        unpaid.discard(pay_date)
                     ent = self._entitled.get((symbol, pay_date))
                     if ent is None:                                           # entitlement not seen (window started late): holder at start of day
                         face_orig = 0.0 if defaulted else self._entitled_face(bond, pay_date, d, units_now, today.get(symbol, 0.0))
                         self._book_entitlement(ts_now, d, bond, pay_date, interest_per_100 * face_orig / 100.0, principal_per_100, face_orig, "DEAL_WATERFALL")
                         ent = self._entitled[(symbol, pay_date)]
+                        if unpaid is not None:
+                            unpaid.discard(pay_date)
+                        elif symbol in self._unpaid:
+                            self._unpaid[symbol].discard(pay_date)
                     interest_cash, _, face_orig = ent
                     if abs(face_orig) < 1e-9:
                         continue
@@ -497,6 +643,7 @@ class FixedIncomeLedger:
                         self.policy.principal_reduction(ev.id, ts_now, symbol, bond.currency, frac, cash)
                         adjustments.append(Money(cash, ccy))
                         self.cashflows.append(CashflowRecord(pd.Timestamp(ts_now, tz="UTC"), d, symbol, "PRINCIPAL", cash, principal_per_100 * paid_face / 100.0, "deal waterfall principal", bond.currency))
+                self._tranche_pay_cursor[symbol] = i
                 continue
             if bond.coupon_type != CouponType.ZERO:
                 sched = bond.schedule
@@ -514,6 +661,8 @@ class FixedIncomeLedger:
                         inputs = inputs or self.env.market_inputs(symbol, d)
                         self._book_entitlement(ts_now, d, bond, period.payment_date, period_coupon_amount(bond, period, inputs) * face_orig / 100.0 if abs(face_orig) > 1e-9 else 0.0, 0.0, face_orig, "SCHEDULE")
                         ent = self._entitled[key]
+                    if symbol in self._unpaid:
+                        self._unpaid[symbol].discard(period.payment_date)
                     cash, _, face_orig = ent
                     if abs(cash) > 1e-9:
                         ev = self._event(EventType.COUPON_PAYMENT, ts_now, symbol, {"amount": cash, "currency": bond.currency, "payment_date": period.payment_date.isoformat()})
@@ -534,6 +683,8 @@ class FixedIncomeLedger:
                     adjustments.append(Money(cash, ccy))
                     self.cashflows.append(CashflowRecord(pd.Timestamp(ts_now, tz="UTC"), d, symbol, "PRINCIPAL", cash, (f_prev - f_now) * orig_face, f"factor {f_prev:.6f}->{f_now:.6f}", bond.currency))
                 self._factor_applied[symbol] = f_now
+            if unpaid is not None and not unpaid:
+                self._unpaid.pop(symbol, None)
         return adjustments
 
     # ------------------------------------------------------------------ corporate actions
@@ -569,10 +720,13 @@ class FixedIncomeLedger:
                 continue
             if act.action in ("CALL", "PUT", "TENDER", "MATURITY"):
                 face = units_to_face(units) * self.env.factor(act.symbol, d)
-                accrued_per_100 = accrued_interest(bond, act.effective_date, self.env.market_inputs(act.symbol, d))
-                period = bond.current_period(act.effective_date)
-                if period is not None and period.accrual_start == act.effective_date:
-                    accrued_per_100 = 0.0
+                if bond.terms_free:
+                    accrued_per_100 = self.env.accrued(act.symbol, d)
+                else:
+                    accrued_per_100 = accrued_interest(bond, act.effective_date, self.env.market_inputs(act.symbol, d))
+                    period = bond.current_period(act.effective_date)
+                    if period is not None and period.accrual_start == act.effective_date:
+                        accrued_per_100 = 0.0
                 cash = accrued_per_100 * face / 100.0
                 self._event(EventType.REDEMPTION if act.action == "MATURITY" else EventType.EXERCISE, ts_now, act.symbol, {"action": act.action, "price": act.price, "accrued": cash})
                 if abs(cash) > 1e-9:
@@ -603,6 +757,8 @@ class FixedIncomeLedger:
         hold buys (the fill gate), source repo against eligible holdings, ask the strategy to liquidate
         by rule, and declare a funding default only when the shortfall persists."""
         adjustments: list[Money] = []
+        if not self.env.is_trading_date(d):                     # settlement and repo happen on business days; holdings have no marks today
+            return adjustments
         obligations = [Obligation(p.settle_date, p.currency, -p.cash_amount, "SETTLEMENT", p.trade_event_id) for p in self.queue.pending(self.base) if p.cash_amount < 0]
         receipts = [Obligation(p.settle_date, p.currency, p.cash_amount, "SETTLEMENT", p.trade_event_id) for p in self.queue.pending(self.base) if p.cash_amount > 0]
         a = self.assessor.assess(d, self.base, self.ledger.cash(self.base), self.reservations.reserved_cash(self.base), obligations, receipts)
@@ -688,7 +844,7 @@ class FixedIncomeLedger:
             mark = self.env.mark(bond.symbol, d)
             clean = mark.clean_mid if mark else 0.0
             defaulted = bond.symbol in self._defaulted and self._defaulted[bond.symbol] <= d
-            accrued = 0.0 if defaulted else self._holder_accrued_per_100(bond, self.env.settle_date(bond, d), self.env.market_inputs(bond.symbol, d), self.env.entitlement_rule(bond))
+            accrued = 0.0 if defaulted else self._holder_accrued_per_100(bond, self.env.settle_date(bond, d), self.env.market_inputs(bond.symbol, d), self.env.entitlement_rule(bond), d)
             an = self.env.analytics(bond.symbol, d)
             fx = self.env.fx(bond.currency, d) or 1.0
             out.append(HoldingSnapshot(bond.symbol, face, orig_face, factor, clean, accrued, face * (clean + accrued) / 100.0 * fx, an.mod_duration if an else None, an.spread_duration if an else None, an.z_spread_bp if an else None, mark.tier.value if mark else "NONE", self.env.evidence(bond.symbol, d).value if mark else "STALE", bond.currency))
@@ -732,12 +888,16 @@ class FixedIncomeLedger:
             "model_marked_share": (sum(v for k, v in by_evidence.items() if k in ("MODEL", "STALE")) / mv) if mv else 0.0,
             **{f"evidence_{k.lower()}_share": (v / mv if mv else 0.0) for k, v in by_evidence.items()},
             "ledger_balanced": balanced, "funding_breach": bool(self.funding_events and self.funding_events[-1]["date"] == d),
-            "repo_balance": self.repo_balance, "funding_shortfall": self.funding_shortfall, "foreign_cash_base": sum(v * fx(c) for c, v in foreign_cash.items()), "fx_translation": self.ledger.class_total(AccountClass.EQUITY, self.base, fx) - sum(self.ledger.balance(a, currency=self.base) for a in (Account.CAPITAL, Account.REALIZED_PNL, Account.UNREALIZED_PNL)) if foreign_cash else 0.0,
+            "repo_balance": self.repo_balance, "funding_shortfall": self.funding_shortfall, "foreign_cash_base": sum(v * fx(c) for c, v in foreign_cash.items()), **(self.margin.last if self.margin is not None else {}), "fx_translation": self.ledger.class_total(AccountClass.EQUITY, self.base, fx) - sum(self.ledger.balance(a, currency=self.base) for a in (Account.CAPITAL, Account.REALIZED_PNL, Account.UNREALIZED_PNL)) if foreign_cash else 0.0,
         })
-        for h in holds:
-            self.holdings_history.append({"date": pd.Timestamp(d), **h.__dict__})
+        keep = self.holdings_frequency == "D" or (self.holdings_frequency == "M" and (self.env.calendar.add_business_days(d, 1).month != d.month or d == self.env.end_date)) or (self.holdings_frequency == "END" and d == self.env.end_date)
+        if keep:
+            for h in holds:
+                self.holdings_history.append({"date": pd.Timestamp(d), **h.__dict__})
         self._last_nav = nav
         self._last_snapshot_date = d
+        if self.funding_policy.repo_for_leverage:
+            self.repo_capacity_cached = self._repo_capacity(d, positions)
 
     # ------------------------------------------------------------------ frames
     def nav_frame(self) -> pd.DataFrame:

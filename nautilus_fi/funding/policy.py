@@ -34,6 +34,7 @@ class FundingPolicy:
     allow_fx_conversion: bool = True               # foreign purchases may be funded from base cash at spot
     repo_haircut: float = 0.02
     failure_after_business_days: int = 5           # unresolved shortfall persisting this long is a funding default
+    repo_for_leverage: bool = False                # strategies may buy beyond settled cash against repo capacity (financed leverage)
 
     def bridge_allowance(self) -> float:
         return self.max_bridge if self.allow_bridge else 0.0

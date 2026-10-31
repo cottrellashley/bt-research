@@ -11,6 +11,7 @@ from nautilus_fi.backtest.environment import MarketEnvironment
 from nautilus_fi.core.context import DecisionContext
 from nautilus_fi.core.events import EventLog
 from nautilus_fi.core.manifest import ExperimentManifest
+from nautilus_fi.domain.conventions import Conventions
 from nautilus_fi.execution.assumptions import ExecutionAssumptions
 from nautilus_fi.execution.fill_model import FixedIncomeFillModel
 from nautilus_fi.execution.windows import ExecutionWindowSchedule
@@ -39,6 +40,12 @@ class StrategyServices:
     settle_date: Callable[[BondSpec, date], date]
     record_decision: Callable[[str, float, date], None]
     terms_known_as_of: Callable[[str, date], BondSpec] | None = None
+    conventions: Conventions | None = None
+    benchmark_field: str = "benchmark.weight"          # generic field carrying the benchmark's weights (published by the actor)
+    margin_venue: str | None = None                    # overlays / synthetic shorts venue (None: no margin venue)
+    short_suffix: str = "-TRS"
+    overlay_book: object | None = None                 # overlays.OverlayBook
+    prefund_margin: Callable[[float], float] | None = None   # top up margin collateral for an initial-margin need (base currency)
 
 
 @dataclass
@@ -57,6 +64,7 @@ class FixedIncomeContext:
     venue: str = "OTC"
     base_currency: str = "USD"
     restricted: set[str] = field(default_factory=set)
+    overlay_fill_model: object | None = None
 
 
 __all__ = ["FixedIncomeContext", "StrategyServices"]

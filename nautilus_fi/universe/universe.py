@@ -7,6 +7,7 @@ in the environment with their final cashflows and recovery prices.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import date
@@ -44,10 +45,24 @@ class PointInTimeUniverse:
     def _in_index(self, symbol: str, d: date) -> bool:
         if not self.membership:
             return True
-        prior = [m for m in self._membership_dates if m <= d]
-        if not prior:
+        i = bisect_right(self._membership_dates, d)
+        if i == 0:
             return False
-        return symbol in self.membership[prior[-1]]
+        return symbol in self.membership[self._membership_dates[i - 1]]
+
+    @staticmethod
+    def from_weights(env, panel, field_name: str = "benchmark.weight") -> PointInTimeUniverse:
+        """Membership snapshots from a daily benchmark weight field (one snapshot per change)."""
+        W = panel[field_name] > 0
+        memb: dict[date, set[str]] = {}
+        prev = None
+        for i, d in enumerate(panel.dates.date):
+            row = W[i]
+            if prev is None or (row != prev).any():
+                memb[d] = set(panel.ids[row])
+                prev = row
+        u = PointInTimeUniverse(env, memb)
+        return u
 
     def members(self, d: date, filt: UniverseFilter | None = None) -> list[BondSpec]:
         filt = filt or UniverseFilter()

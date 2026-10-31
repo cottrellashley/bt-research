@@ -31,7 +31,7 @@ LIQUIDITY_FLOOR = {
 }
 
 
-@dataclass
+@dataclass(slots=True)                                   # one per bond-day: slots halve the memory
 class LiquidityStats:
     volume_5d: float = 0.0
     trade_count_20d: int = 0

@@ -4,8 +4,8 @@ Generated from `nautilus_fi.support.default_support_matrix()`; every run's manif
 
 | Status | Meaning | Count |
 | --- | --- | --- |
-| VALIDATED | mechanics covered by a fixture or invariant test named in the row | 20 |
-| SUPPORTED_WITH_APPROXIMATION | runs, with the simplification stated in the row | 22 |
+| VALIDATED | mechanics covered by a fixture or invariant test named in the row | 33 |
+| SUPPORTED_WITH_APPROXIMATION | runs, with the simplification stated in the row | 28 |
 | EXPERIMENTAL | code path exists, not validated end to end | 2 |
 | UNSUPPORTED | refused by the builder | 5 |
 
@@ -13,7 +13,7 @@ Generated from `nautilus_fi.support.default_support_matrix()`; every run's manif
 | --- | --- | --- | --- | --- |
 | ABS | tranche_cashflows | SUPPORTED_WITH_APPROXIMATION | same waterfall engine as CLO |  |
 | BILL | discount_yield_quotation | VALIDATED |  | bill yield conversion; maturity at par |
-| CDS | single_name_and_index | SUPPORTED_WITH_APPROXIMATION | flat hazard per tenor; quarterly accrual-on-default | credit event payout; index factor |
+| CDS | single_name_and_index | SUPPORTED_WITH_APPROXIMATION | flat hazard per tenor; quarterly accrual-on-default; CDX tradable on the margin venue (price 100 - upfront, running coupon as daily carry; defaults in the supplied price) | credit event payout; index factor |
 | CLO | external_engine | EXPERIMENTAL | adapter contract only (Intex not integrated) |  |
 | CLO | waterfall_triggers_reinvestment | SUPPORTED_WITH_APPROXIMATION | simplified OC/IC tests, sequential/pro-rata principal, equity residual | trigger breach redirects cash; conservation |
 | CMBS | tranche_cashflows | SUPPORTED_WITH_APPROXIMATION | same waterfall engine; no loan-level CMBS specifics |  |
@@ -32,9 +32,12 @@ Generated from `nautilus_fi.support.default_support_matrix()`; every run's manif
 | DISTRESSED | default_lifecycle | VALIDATED |  | missed payment -> grace -> default -> distributions -> discharge |
 | DISTRESSED | exchange_restructuring | VALIDATED |  | old debt becomes cash plus new debt and equity |
 | FUND | nav_vs_market | SUPPORTED_WITH_APPROXIMATION | price/NAV series supplied; no creation mechanics |  |
-| FUTURES | treasury_futures | SUPPORTED_WITH_APPROXIMATION | CTD by implied repo among supplied basket; VM settled daily | daily VM without duplicate P&L |
-| FX | forwards_and_hedging | SUPPORTED_WITH_APPROXIMATION | forward points by tenor; rolling program | hedged vs unhedged decomposition |
-| IRS | valuation_margin | SUPPORTED_WITH_APPROXIMATION | single-curve fallback when no projection curve; flat forwards per period | par swap values to zero; VM/CTM postings |
+| FUTURES | treasury_futures | SUPPORTED_WITH_APPROXIMATION | CTD by implied repo among supplied basket; VM settled daily; tradable on the margin venue as dated contracts closed at the last price (rolls are the strategy's) | daily VM without duplicate P&L |
+| FX | forwards_and_hedging | SUPPORTED_WITH_APPROXIMATION | forward points by tenor; rolling program; forwards tradable on the margin venue as dated contracts, cash-settled at the last price | hedged vs unhedged decomposition |
+| GOVERNANCE | official_records | VALIDATED |  | gates refuse missing Implement / reconciliation / unconfirmed conventions; hash-chained registry |
+| GOVERNANCE | trial_ledger | VALIDATED |  | every run recorded; DSR uses the ledger's trial variance; PBO over the variant matrix; holdout guard |
+| GOVERNANCE | walk_forward | VALIDATED |  | purge and embargo in trading days; validation and out-of-sample trials recorded |
+| IRS | valuation_margin | SUPPORTED_WITH_APPROXIMATION | single-curve fallback when no projection curve; flat forwards per period; tradable on the margin venue as a financed contract on a supplied price (NPV) series | par swap values to zero; VM/CTM postings |
 | LINKER | indexation_uk_eur_ca | SUPPORTED_WITH_APPROXIMATION | lag/interpolation per convention; no seasonality |  |
 | LINKER | indexation_us_tips | VALIDATED |  | Canadian interpolation; known vs projected CPI; maturity floor |
 | LOAN | amendments | VALIDATED |  | effective vs announcement dated terms |
@@ -46,12 +49,28 @@ Generated from `nautilus_fi.support.default_support_matrix()`; every run's manif
 | MONEY_MARKET | amortized_cost_liquidity_fee | SUPPORTED_WITH_APPROXIMATION | straight-line amortized cost; 2a-7 style fee rule |  |
 | MUNICIPAL | extraordinary_redemption | UNSUPPORTED |  |  |
 | MUNICIPAL | tax_treatment | SUPPORTED_WITH_APPROXIMATION | investor profile rates; no AMT or de minimis rules | after-tax proceeds |
+| PLATFORM | benchmark_objects | VALIDATED |  | constituent weights reconstruct the index; drift vs static; custom caps and subsets |
+| PLATFORM | benchmark_relative_constraints | VALIDATED |  | new buys checked, turnover budgets scale trades, benchmark bands and active exposures evaluated and logged |
+| PLATFORM | conventions_registry | VALIDATED |  | turnover / annualisation / excess-return / missing-return definitions; legacy profiles recorded |
+| PLATFORM | data_loaders | SUPPORTED_WITH_APPROXIMATION | Snowflake / FIAtlas mappings are templates until pointed at the deployed views | SQL mapping, scaling, knowledge-time stamping into the point-in-time stores |
 | PLATFORM | dated_settlement | VALIDATED |  | US T+2 -> T+1 on 28 May 2024 |
 | PLATFORM | double_entry_ledger | VALIDATED |  | 1,030 fixture; conservation |
 | PLATFORM | execution_process | SUPPORTED_WITH_APPROXIMATION | RFQ panel and liquidity gate are scenario assumptions until calibrated on own order history |  |
 | PLATFORM | historical_counterfactual | EXPERIMENTAL | dependency rules validated; driver recomputation partial |  |
+| PLATFORM | margin_venue_overlays | SUPPORTED_WITH_APPROXIMATION | financed contracts (TRS, CDX, synthetic bond TRS) settle carry daily as Nautilus funding; futures / FX forwards close at the last price; collateral moves by rule | NAV identity with margin equity; collateral location does not change NAV |
+| PLATFORM | optimiser | VALIDATED |  | bands, turnover, min holding, cardinality, factor tracking error, CVaR; infeasible problems relax or hold |
+| PLATFORM | panel_engine | VALIDATED |  | benchmark replication without costs tracks to 1e-9; oracle signal earns nothing with a two-day lag |
+| PLATFORM | paper_implement_reconciliation | VALIDATED |  | holdings gap + cash + execution + residual equals the shortfall |
 | PLATFORM | point_in_time_replay | VALIDATED |  | replay by availability time; temporal isolation invariant |
+| PLATFORM | rebalance_calendars | VALIDATED |  | BME / BMS / W-WED / index calendars / triggered rebalancing in both engines |
+| PLATFORM | repo_financed_leverage | SUPPORTED_WITH_APPROXIMATION | repo drawn at settlement against eligible holdings at cash rate + spread; single funding agreement | gross exposure above NAV stays solvent; financing booked |
+| PLATFORM | signal_evaluation | VALIDATED |  | IC / quantile spread on a known signal; noise IC near zero; forward windows start after the trade |
 | PLATFORM | stochastic_simulation | UNSUPPORTED |  |  |
+| PLATFORM | streamed_replay | VALIDATED |  | streamed and one-shot runs give identical NAV and event-chain hashes |
+| PLATFORM | synthetic_shorts | SUPPORTED_WITH_APPROXIMATION | short cash bonds as bond TRS on the margin venue: financing received, coupon paid, borrow fee charged; no recall or specials | cash-venue short rejected; TRS short carried with borrow fee |
+| PLATFORM | terms_free_instruments | SUPPORTED_WITH_APPROXIMATION | vendor accrued and supplied cashflows replace terms; no matrix pricing or stale roll without terms | supplied coupon paid under the entitlement rule; NAV identity |
+| PLATFORM | trade_proposals | SUPPORTED_WITH_APPROXIMATION | CRD / QOE / PORT layouts are column maps to confirm against each system's import specification | bid / ask dirty pricing, settlement dates, pre-trade checks, position reconciliation |
+| PLATFORM | vendor_analytics | VALIDATED |  | vendor OAS / OAD / OASD used; COMPARE records differences |
 | PREFERRED | coupon_deferral | VALIDATED |  | cumulative vs non-cumulative deferral |
 | PREFERRED | discretionary_call | VALIDATED |  | no assumed redemption at first call |
 | PREFERRED | writedown_conversion | SUPPORTED_WITH_APPROXIMATION | trigger on supplied metric; no capital model |  |

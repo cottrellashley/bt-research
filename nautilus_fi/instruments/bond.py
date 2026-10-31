@@ -153,6 +153,7 @@ class BondSpec:
     price_precision: int = 4
     identifiers: Identifiers = field(default_factory=Identifiers)
     tags: dict[str, Any] = field(default_factory=dict)
+    terms_source: str = "TERMS"               # TERMS: cashflows from contract terms; VENDOR: terms-free (vendor prices, accrued, analytics, supplied cashflows)
 
     # ------------------------------------------------------------------ derived
     def __post_init__(self) -> None:
@@ -168,6 +169,10 @@ class BondSpec:
             self.inflation = InflationTerms()
         if self.principal_type in (PrincipalType.AMORTIZING, PrincipalType.SINKING) and self.amortization is None:
             self.amortization = AmortizationTerms()
+
+    @property
+    def terms_free(self) -> bool:
+        return self.terms_source == "VENDOR"
 
     @property
     def calendar(self) -> BondCalendar:

@@ -30,6 +30,30 @@ Honest status per blueprint area is in [docs/blueprint_status.md](docs/blueprint
 product / feature support matrix is in [docs/support_matrix.md](docs/support_matrix.md). Every run
 carries the rows that apply to it.
 
+## One research spec, four stages
+
+Beside the event engine sits a research platform that covers the six families of fixed income
+backtesting work: index timing, cross-sectional signals, index-tracking optimisation, derivatives and
+overlays, implementation, and governance. See [docs/generalisation.md](docs/generalisation.md).
+
+| Stage | What it is | Package |
+| --- | --- | --- |
+| Evaluate | rank IC by horizon, quantile and Q5-Q1 spreads, Newey-West t-statistics, block bootstrap, neutralised IC | `nautilus_fi.paper.evaluate` |
+| Paper | vectorised simulation on return panels: lags in trading days, per-change costs, leverage, shorts, overlays, drifting weights; no terms needed; 9k bonds x 10y in seconds to minutes | `nautilus_fi.paper` |
+| Implement | the event engine, generalised: vendor analytics, generic fields, benchmark constituents, terms-free bonds, margin venue (TRS, CDX, futures, FX forwards, synthetic shorts), repo-financed leverage, streamed replay | `nautilus_fi.backtest`, `nautilus_fi.overlays` |
+| Propose | the same construction spec as orders: bid/ask dirty pricing, settlement dates, pre-trade checks, CRD / QOE / PORT files, reconciliation | `nautilus_fi.propose` |
+
+Shared by every stage:
+
+| Component | What it is | Package |
+| --- | --- | --- |
+| Research spec | `ResearchSpec(decider, construction, universe, calendar, conventions)` hashed into manifests and the trial ledger | `nautilus_fi.domain` |
+| Conventions | timing lag, excess-return method, weight drift, turnover, annualisation and missing-return policy, as named, recorded settings with legacy profiles | `nautilus_fi.domain.conventions` |
+| Benchmarks | published constituents, custom (filters, caps), composites, return-series-only | `nautilus_fi.benchmarks` |
+| Construction | signal transforms, quantile / rank / tilt / pair / hedge methods, one constraint grammar, LP / MILP / QP / CVaR optimiser on HiGHS | `nautilus_fi.construct` |
+| Governance | trial ledger (every run), DSR and PBO from it, walk-forward with purge and embargo, gated hash-chained official records | `nautilus_fi.governance` |
+| Data | bitemporal field store, panels, SQL / Snowflake / FIAtlas / file loaders | `nautilus_fi.data` |
+
 ## Install
 
 ```bash
@@ -48,7 +72,13 @@ example scripts add the checkout to `sys.path`, so they also run without the edi
 python examples/run_fund_sleeves.py --quick    # 13 fund-style sleeves on a 51-instrument synthetic market
 python examples/run_carry_strategy.py --quick  # one strategy under GROSS vs NET_SPREAD vs NET_FULL
 python examples/run_cost_scenarios.py          # cost stress x1/x2/x3 and a capacity sweep
-pytest                                         # 92 tests, several minutes (environment builds dominate)
+python examples/family1_index_timing.py        # index excess-return timing, walk-forward, TRS on a margin venue
+python examples/family2_signal_evaluation.py   # rank IC, quintiles, Newey-West, bootstrap, neutralisation
+python examples/family3_index_tracking.py      # custom capped benchmark + optimiser (--milp, --full: 9k x 10y)
+python examples/family4_overlays.py            # duration hedge, CDX, DTS-neutral pairs; margin venue book
+python examples/family5_implementation.py      # Paper vs Implement reconciliation, trade proposal files
+python examples/family6_governance.py          # pre-registration, trial ledger, DSR / PBO, official record
+pytest                                         # 141 tests, several minutes (event-engine runs dominate)
 ```
 
 A strategy is a `FixedIncomeStrategy` that sees the market only through its `DecisionContext`
@@ -139,6 +169,12 @@ drift reported as attribution rather than charged twice.
   factor instruments carry original face and a factor-adjusted price. Nautilus v2 does not allow
   multiplier instruments on cash accounts, and cash accounting is the whole point. Strategies never
   see this: `order_face`, `holdings_face`, `rebalance_to_weights`.
+* Nautilus refuses short sales on cash accounts, so shorts, index exposure and derivatives live on a
+  second, MARGIN venue (`BacktestSettings(margin=MarginSettings(...))`): financed contracts
+  (`PerpetualContract` with daily funding as the carry) for TRS, CDX and synthetic bond TRS, dated
+  contracts (`FuturesContract`) for futures and FX forwards. The ledger books the margin account
+  (collateral, realized P&L and funding, unrealized P&L, borrow fees) so NAV and the invariants cover
+  both venues; collateral is prefunded before overlay orders and moved between venues by rule.
 * Maturities, calls, tenders and recoveries are `InstrumentClose` events at the redemption price;
   the ledger books accrued due at redemption, stops accrual on default, carries claims at recovery
   marks and writes off entitled-but-unpaid coupons.
@@ -170,6 +206,14 @@ builder.with_tranche_payments(trustee).with_ratings(ratings).with_corporate_acti
 env = builder.build()          # refuses instruments whose required data is missing (or excludes them when lenient)
 ```
 
+`nautilus_fi.data.loaders` maps source tables to these frames (`DatasetMapping`), runs them on any
+DB-API driver (`SQLLoader`; `snowflake_loader` reads credentials from the environment), ships a FIAtlas
+catalogue template and file loaders, and writes every pull to the point-in-time and field stores
+(`load_into_stores`); `builder_from_frames` hands them to the builder. Vendor analytics go in with
+`with_analytics(df, source="VENDOR" | "VENDOR_ELSE_COMPUTED" | "COMPARE")`, any per-bond series with
+`with_fields`, index constituents with `with_benchmark_constituents`, terms-free bonds with
+`terms_source="VENDOR"` plus `with_supplied_cashflows`.
+
 Calibrate `ParametricCostModel`, `VolumeGatedLiquidityModel` and the RFQ panel parameters on your
 own TRACE / RFQ history (the defaults encode stylised facts, not your desk), then validate simulated
 fill rates, delays and slippage against realised TCA. The support matrix marks the execution process
@@ -193,20 +237,30 @@ nautilus_fi/
   research/      experiment, walkforward, statistics, stress
   validation/    invariants, tolerances
   reports/       bundle
-  backtest/      environment, builder, strategy, actor, context, result, scenarios
-  synthetic/     generator (every product family, three structured deals)
+  backtest/      environment, builder, strategy, spec_strategy, actor, context, result, scenarios
+  synthetic/     generator (every product family, three structured deals), panels (index-scale universe)
+  domain/        conventions, rebalance calendars, field definitions, research spec and decision API
+  benchmarks/    published, custom, composite and return-series benchmarks
+  construct/     cross-sections, signal transforms, constraint grammar, methods, optimiser (HiGHS)
+  paper/         panel engine, signal evaluation, Paper / Implement reconciliation
+  governance/    trial ledger, walk-forward, official records
+  overlays/      margin-venue contracts (TRS, CDX, bond TRS, futures, FX forwards) and fill model
+  propose/       trade proposals, OMS / PORT writers, reconciliation
+  data/          ... plus panel, field_store, loaders/ (sql, snowflake, fiatlas, files)
   support.py     the declared support matrix
-examples/        fund_sleeves, strategies, run_fund_sleeves, run_carry_strategy, run_cost_scenarios
-tests/           92 tests: core, products, lifecycle/funding, market/pricing, execution/portfolio,
-                 research/validation, redemption accounting, fund sleeves, end to end
-docs/            architecture, data contracts, bias checklist, support matrix, blueprint status
+examples/        fund_sleeves, strategies, run_fund_sleeves, run_carry_strategy, run_cost_scenarios, family1..6
+tests/           141 tests: the original 92 plus conventions / data, construction, paper / governance,
+                 the generalised event engine, proposals / loaders
+docs/            architecture, generalisation, data contracts, bias checklist, support matrix, blueprint status
 ```
 
 ## Known limits
 
-See [docs/blueprint_status.md](docs/blueprint_status.md) for the full list. The short version:
-derivatives, TBA delivery, FX hedge programs, securities lending and strategy-driven repo exist as
-valuation and posting modules but are not tradable inside the Nautilus venue; the external deal
-engine is an adapter contract; the stochastic simulation run mode, auction events, covenants,
-extraordinary municipal redemptions and convertibles are not built; vendor loaders and the
-calibration of the execution process on your own order history are yours.
+See [docs/blueprint_status.md](docs/blueprint_status.md) and the last section of
+[docs/generalisation.md](docs/generalisation.md) for the full list. The short version: TBA delivery,
+FX hedge programs and securities lending remain valuation and posting modules; derivatives, shorts and
+repo-financed leverage trade through the margin venue and the funding policy with the approximations
+the support matrix states; the external deal engine is an adapter contract; the stochastic
+simulation run mode, auction events, covenants, extraordinary municipal redemptions and convertibles
+are not built; OMS / PORT layouts and the FIAtlas catalogue are templates to confirm against your
+systems; and the execution process still needs calibrating on your own order history.

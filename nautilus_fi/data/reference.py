@@ -91,10 +91,19 @@ def bond_from_row(row: pd.Series | dict) -> BondSpec:
             projected_cpr=float(g("projected_cpr")) if g("projected_cpr") not in (None, "") and not pd.isna(g("projected_cpr")) else None,
         )
     lag = g("settlement_lag_days")
+    terms_source = str(g("terms_source") or "TERMS").upper()
+    if terms_source not in ("TERMS", "VENDOR"):
+        raise ValueError(f"{r['symbol']}: terms_source must be TERMS or VENDOR")
+    issue = _to_date(r.get("issue_date"))
+    if issue is None:
+        if terms_source != "VENDOR":
+            raise ValueError(f"{r['symbol']}: issue_date is required unless terms_source is VENDOR")
+        issue = date(1900, 1, 1)                          # terms-free: existence comes from vendor data
     return BondSpec(
+        terms_source=terms_source,
         symbol=str(r["symbol"]),
         issuer=str(r["issuer"]),
-        issue_date=_to_date(r["issue_date"]),
+        issue_date=issue,
         maturity=_to_date(g("maturity")),
         coupon_rate=float(g("coupon_rate") or 0.0),
         coupon_type=coupon_type,

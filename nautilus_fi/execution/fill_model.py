@@ -102,6 +102,7 @@ class FixedIncomeFillModel(FillModel):
         self._seq = 0
         self.funding_rejects: list[dict] = []
         self._committed_base = 0.0          # dirty value of buys offered in the current window, base currency
+        self.touched: set[str] = set()      # orders evaluated since the ledger's last pass (their fills are processed incrementally)
 
     # ---- Nautilus FillModel interface ---------------------------------------------------
     def is_limit_filled(self) -> bool:
@@ -115,6 +116,7 @@ class FixedIncomeFillModel(FillModel):
 
     def get_orderbook_for_fill_simulation(self, instrument, order, best_bid, best_ask):
         book = OrderBook(instrument.id, BookType.L2_MBP)
+        self.touched.add(str(order.client_order_id))
         if self.clock is None:
             return book
         now_ns = self.clock.timestamp_ns()
