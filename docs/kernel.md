@@ -71,9 +71,11 @@ src = nfi.CachedSource(
 * **Availability.** `FieldInfo.lag` is how many trading days after its date a value may be used.
   Vendor analytics published the next morning have lag 1. `Field` applies the lag when it reads,
   so every expression is point in time by construction; `Field("x", lag=0)` on a lag-1 field
-  raises `LookaheadError`. `FieldStoreSource` reads true knowledge times: a request's `as_of`
-  gives the latest snapshot known then, and `mode="first"` gives what a live process saw before
-  revisions.
+  raises `LookaheadError`. The lag governs decisions only: realised returns are read without it
+  (see "Data: what is known, what is realised" below). `FieldStoreSource` reads true knowledge
+  times: a request's `as_of` gives the latest snapshot known strictly before it, and
+  `mode="first"` gives what a live process saw before revisions (the only mode that counts as
+  point-in-time for official records).
 * **Discovery.** `catalog().search("spread duration")` matches names, descriptions and tags.
   An unknown name raises `UnknownFieldError` with close matches. `fields_from_dictionary(df)`
   turns the platform's data dictionary into the catalogue.
@@ -128,16 +130,66 @@ Every rebalance logs the method's diagnostics, which constraints bound, and any 
 heuristic method is post-checked against `.checked(...)` constraints; `.subject_to(...)` projects
 it onto them (nearest feasible portfolio in L1).
 
+More constraints and constructions are in [primitives.md](primitives.md):
+
+* tracking-error limits (`TEV(model) <= x`, `TargetTE`, `MaxIR`, `MaxSharpe`);
+* `MinTrade` and a tie-break stage;
+* per-name `Bounds`, `Pin`, `NoSell`, `NoBuy` and `TradeLimit`;
+* bounds that change by date, subsets (`.where`) and relative caps (`GroupWeight.cap`);
+* the recorded relaxation ladder, and `Sparse`;
+* `Stratified`, `ZScoreRule` and `Rules`.
+
+`Hedge(..., joint=True)` makes the overlays decision variables of the optimiser, so its exposure
+limits count the hedge.
+
 ## Mechanics and conventions
 
 The named conventions of the legacy frameworks (`domain.conventions`) are presets of these
 objects:
 
-* `strategy.under("MRI_v1")` re-runs a strategy with that framework's timing, missing-return,
-  excess-return, turnover, annualisation and benchmark-drift rules. Costs, universe and signal stay
-  the same.
+* `strategy.under("MRI_v1")` re-runs a strategy with that framework's execution timing,
+  missing-return, excess-return, turnover and annualisation rules, the benchmark weight drift
+  (applied to every `Index` in the benchmark, derived and blended ones included), and zero cash
+  when the profile says cash earns nothing. The schedule, costs, universe, signal and portfolio stay
+  as they are: rebalancing is a strategy choice, not a convention. A profile that refills bad dates
+  (`erin_beta_plus`) needs the refill field: `under("erin_beta_plus", refill="tr_vendor_b")`.
 * `strategy.conventions()` is the record that manifests, the ledger and the official gates read.
+  It is computed from the values: mechanics that carry an unconfirmed legacy profile's
+  distinguishing conventions are unconfirmed whatever the strategy is called, so
+  `under("paperport").with_(profile="kernel")` is still unconfirmed.
 * Profiles still marked `confirmed=False` cannot be promoted to CANDIDATE.
+* `Strategy(hold="constant")` holds the traded weights between rebalances instead of letting them
+  drift (fi-lib-research's constant exposure), at Paper fidelity.
+
+## Data: what is known, what is realised
+
+* **Availability vs realisation.** A field's `lag` is when a value may inform a decision:
+  `Field("oas_bp")` on row *t* reads the value published by *t*. Returns are outcomes: the engine
+  reads the return field, the excess-return legs and refills *realised* (unlagged, aligned to the
+  period they cover), so declaring `tr` with `lag=1` changes what a momentum signal sees, not the
+  P&L. A field stamped with the start of its period declares `FieldInfo(..., label="start")`.
+* **One trading calendar.** A panel's rows are the return field's dates; a field or date series
+  dated between them (a Saturday month end) moves to the next trading day, compounded for returns
+  and carried for levels, and the move is counted (`missing["snapped_observations"]`).
+* **Missing data never fills silently.** The strategy's `MissingReturns` applies to held
+  instruments, benchmark members, the cash series and the risk-free series alike; under `Fail()`
+  (the default) a gap stops the run. A held instrument whose returns just stop is missing data unless
+  the source says it exits (an `alive` field, or a maturity / call / exit date). `DropDates(threshold)`
+  removes bad dates from the run (portfolio, benchmark and statistics; cash accrues over them).
+  Every fill is counted in `result.missing` and `stats()["data_fills"]`, and the promotion gate
+  refuses any. `HalfSpread` raises for a traded name with no spread unless given `fallback_bp`.
+  Duplicate `(date, id)` rows and two panels disagreeing on a field raise; returns whose median
+  absolute value looks like percentages raise; a NAV that reaches zero stops the run.
+* **Exits and outages.** `Strategy(exits="SELL")` (default) sells a held name that leaves the
+  universe at the next rebalance, outside any turnover budget, and reports it as a forced sale;
+  `"EXCLUDE"` lets it only shrink (sold first within the budget); `"HOLD_NOT_BUY"` keeps it without
+  buying more. A rebalance whose universe is empty, or whose signal has no value for any name in
+  it, keeps the book and logs `aborted`.
+* **Look-ahead.** Expressions are checked structurally and, for custom code, on truncated panels;
+  custom deciders are checked on truncated panels too. Unbounded look-backs (`ffill()`,
+  `cumsum()`) load all history. Knowledge-time reads are strictly before the cutoff
+  (`data.field_store.AS_OF_INCLUSIVE`). `RunSettings(check_lookahead=False)` is recorded and the
+  result cannot be promoted.
 
 ## Strategy identity
 
@@ -159,7 +211,8 @@ objects:
   * `validate(source)` reports missing data, look-ahead and inconsistent parts before a long run.
 * **Escape hatch.** `Strategy(decider=MyDecider(), fields=(...), lookback=n)` runs any `Decider`
   (`decide(view) -> Target`). `Strategy.from_spec(research_spec)` runs a legacy `ResearchSpec`.
-  The kernel reproduces the Paper engine's returns for it exactly; a test asserts this.
+  The kernel reproduces the Paper engine's returns for it exactly, including under `DropDates`
+  and `Triggered(field=...)`; tests assert this.
 
 ## Fidelities and results
 
@@ -175,12 +228,16 @@ objects:
 Both return a `Result` with one schema.
 
 * **Series:** returns, gross, costs, NAV, benchmark returns, daily exposures, rebalances with
-  turnover under all three definitions, weights.
+  turnover under all three definitions, weights, and the excess-return legs (Treasury and vendor).
 * **Breakdowns:** contributions by instrument and by group (with benchmark weights and
-  contributions), the construction log and violations.
+  contributions), the construction log and violations. Implement builds exposures, groups,
+  contributions and excess legs from the event engine's holdings, and its construction log from
+  the event strategy's decisions.
 * **Statistics:** `stats()` comes from one function (`Metrics.stats`), so Paper and Implement
-  report the same keys on the same basis. Implement adds `implement_*` keys such as fill rate,
-  spread cost, delay drift and solvency.
+  report the same keys on the same basis. Excess returns aggregate under the stated method
+  (`COMPOUNDED`: each leg compounded, then differenced; `DAILY_SUM` only when a profile asks for it).
+  Turnover statistics exclude the initial build from cash (reported as `initial_build_turnover`).
+  Implement adds `implement_*` keys such as fill rate, spread cost, delay drift and solvency.
 
 `compare(...)` lines results up. `explain(variant, base)` reports:
 
@@ -195,26 +252,52 @@ Both return a `Result` with one schema.
 7. the difference by calendar year;
 8. a note when a change altered nothing.
 
+## Live decisions and proposals
+
+`decide_at(strategy, source, as_of, current, nav)` runs one decision from a live book: the same
+universe, signal, construction, exit policy and overlay sizing as a backtest.
+`propose.propose_from_strategy` turns it into sized, checked orders with severities and futures
+lines. It also handles PM feedback and fills. `propose.target_book` and `reconcile_book` are the
+interface to an operational store. See [operations.md](operations.md).
+
 ## Sessions and governance
 
 * **Trials.** Every new run in a `Session` is a trial in the ledger. Each trial is one atomic file
   carrying the session, fingerprint, description, statistics and returns, so many agents can write
   at once. The hypothesis registry merges under a lock.
-* **Deduplication.** The same strategy on the same window is one trial, however often it runs and
-  across session restarts.
-* **Selection statistics.** `deflated_sharpe(result)` deflates by the session's distinct trials;
-  `pbo()` covers the session or a sweep.
+* **Deduplication.** Within a session name, the same strategy on the same window and data version
+  is one trial, however often it runs; a persistent session without a name is its root's `default`
+  thread, so restarts deduplicate. Results are cached under the strategy, the data version, the
+  window and every run setting that changes numbers; a source without `version()` is cached in
+  memory only. Trials record the data version and the universe.
+* **Selection statistics.** A trial is a distinct (strategy, data version) at Paper, Validation or
+  Implement stage outside the holdout; relabelled copies with identical returns count once.
+  `deflated_sharpe(result)` and `pbo()` use that one definition.
 * **Sweeps.** `sweep(base, {"portfolio.n": [...]})` or `sweep(builder, {"k": [...]})` runs in
   this process on the shared cache, or in `workers` subprocesses (`kernel.worker`) that read one
   memory-mapped snapshot. Variants whose custom code lives in a script run in this process.
-* **Promotion.** `promote(result, "CANDIDATE")` submits through the official-record gates: a
-  hypothesis registered first, the trial in the ledger, confirmed conventions, no silently
-  zero-filled returns, no hard violations, and DSR from the ledger. OFFICIAL additionally needs an
-  Implement run and its reconciliation.
+* **Promotion.** `promote(result, "CANDIDATE")` submits through the official-record gates
+  (`governance.records`):
+  * the hypothesis: registered before its first trial (the registry stamps the time and freezes
+    the content by hash), the trial in the ledger, and machine-checkable failure criteria
+    (`"sharpe < 0.3 or max_drawdown < -15%"`) that the result does not meet;
+  * conventions confirmed by their values; no filled or altered data; no hard violations or relaxed
+    constructions; look-ahead checks on; at least `min_years` of track record;
+  * DSR and PBO over the whole search the result came from: every trial on the same universe,
+    overlapping window and data version, whatever hypothesis it was filed under, or none
+    (`min_dsr=0.95`, `max_pbo=0.5` above four trials, `min_years=1`: placeholders until the team
+    sets them);
+  * the holdout untouched; one record per result and level.
+
+  OFFICIAL also needs an Implement run of the same fingerprint that completed solvent with
+  manifest hashes, a reconciliation with its content and within tolerance, and a source that
+  declares point-in-time inputs (`source.point_in_time()`). The record chain keeps its head in an
+  anchor file, so a deleted tail fails `verify_chain()`.
 
 ## Performance
 
-Synthetic universe, one core unless stated.
+Synthetic universe, one core unless stated. Reproduce with `tools/probes/kernel_scale.py 9000 10`
+and `tools/probes/kernel_sweep_parallel.py`.
 
 | Run | Time |
 | --- | --- |
@@ -232,6 +315,13 @@ start-up cost: each loads the snapshot and re-evaluates the shared universe, ben
 So use `workers` when variants are expensive (optimiser sweeps), and the shared in-process cache
 when they are cheap. The post-run analytics (group tables, exposures, contributions) are about
 half the time of a heuristic run; the optimiser's solves dominate an optimised one.
+
+## Legacy frameworks
+
+Behaviour specific to one legacy framework is in `nautilus_fi.adapters`, one module per
+framework. Each module has the framework's convention profile, small components built from kernel
+primitives, and parity cases against the framework's golden outputs. `adapters.status()` lists
+them; [adapters.md](adapters.md) says how a profile gets confirmed.
 
 ## Extending
 
@@ -254,5 +344,6 @@ The kernel removes the structural gaps, but not the need for real inputs:
 
 * the company data platform behind the data seam;
 * calibrated cost and impact parameters from your own trading history;
-* golden outputs from the legacy frameworks, to confirm their convention profiles;
+* golden outputs from the legacy frameworks, to run each adapter's parity cases
+  (`adapters.parity`) and confirm its convention profile;
 * contract terms and evaluated prices for Implement fidelity outside the synthetic universe.

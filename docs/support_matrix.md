@@ -1,11 +1,11 @@
 # Support matrix
 
-Generated from `nautilus_fi.support.default_support_matrix()`; every run's manifest carries the rows that apply to the products it holds, and `BacktestSettings.allow_support` refuses runs that need anything above the allowed status (default: EXPERIMENTAL allowed, UNSUPPORTED refused).
+Generated from `nautilus_fi.support.default_support_matrix()` by `tools/support_matrix.py`; every run's manifest carries the rows that apply to the products it holds, and `BacktestSettings.allow_support` refuses runs that need anything above the allowed status (default: EXPERIMENTAL allowed, UNSUPPORTED refused).
 
 | Status | Meaning | Count |
 | --- | --- | --- |
-| VALIDATED | mechanics covered by a fixture or invariant test named in the row | 43 |
-| SUPPORTED_WITH_APPROXIMATION | runs, with the simplification stated in the row | 31 |
+| VALIDATED | mechanics covered by a fixture or invariant test named in the row | 41 |
+| SUPPORTED_WITH_APPROXIMATION | runs, with the simplification stated in the row | 33 |
 | EXPERIMENTAL | code path exists, not validated end to end | 2 |
 | UNSUPPORTED | refused by the builder | 5 |
 
@@ -45,7 +45,7 @@ Generated from `nautilus_fi.support.default_support_matrix()`; every run's manif
 | KERNEL | explain | VALIDATED |  | net difference = holdings + cash and financing + costs + residual; identical results flagged; binding constraints reported |
 | KERNEL | expressions | VALIDATED |  | z-score / rank / demean by group, rolling and differences equal pandas references; neutralised residual orthogonal to the exposure |
 | KERNEL | implement_fidelity | SUPPORTED_WITH_APPROXIMATION | needs an event-engine environment (terms, evaluated prices) from the source or supplied; execution parameters as in the execution process row | the same strategy runs solvent in the event engine with the paper statistics' keys; reconciliation decomposes the gap |
-| KERNEL | index_expressions | VALIDATED |  | constituents reproduce the published index return; exclusions and issuer caps hold at every reconstitution |
+| KERNEL | index_expressions | SUPPORTED_WITH_APPROXIMATION | the published-return check uses a synthetic index built with the same formula (circular); replication against a real index is not yet shown | constituents reproduce the synthetic index return; exclusions and issuer caps hold at every reconstitution |
 | KERNEL | lookahead_checks | VALIDATED |  | leads refused structurally; full-sample code caught on truncated panels; availability lags cannot be undercut |
 | KERNEL | optimiser_expressions | VALIDATED |  | issuer, sector, exposure, weight and turnover limits hold at every rebalance; custom linear constraints bind; penalties need negative coefficients |
 | KERNEL | sessions_and_sweeps | VALIDATED |  | one trial per strategy and window across restarts; concurrent ledger writers; parallel sweeps equal sequential; record gates |
@@ -62,7 +62,7 @@ Generated from `nautilus_fi.support.default_support_matrix()`; every run's manif
 | MONEY_MARKET | amortized_cost_liquidity_fee | SUPPORTED_WITH_APPROXIMATION | straight-line amortized cost; 2a-7 style fee rule |  |
 | MUNICIPAL | extraordinary_redemption | UNSUPPORTED |  |  |
 | MUNICIPAL | tax_treatment | SUPPORTED_WITH_APPROXIMATION | investor profile rates; no AMT or de minimis rules | after-tax proceeds |
-| PLATFORM | benchmark_objects | VALIDATED |  | constituent weights reconstruct the index; drift vs static; custom caps and subsets |
+| PLATFORM | benchmark_objects | SUPPORTED_WITH_APPROXIMATION | index replication checked only against a synthetic index built with the same formula (circular); needs real index returns within the agreed tolerance | constituent weights reconstruct the synthetic index; drift vs static; custom caps and subsets |
 | PLATFORM | benchmark_relative_constraints | VALIDATED |  | new buys checked, turnover budgets scale trades, benchmark bands and active exposures evaluated and logged |
 | PLATFORM | conventions_registry | VALIDATED |  | turnover / annualisation / excess-return / missing-return definitions; legacy profiles recorded |
 | PLATFORM | data_loaders | SUPPORTED_WITH_APPROXIMATION | Snowflake / FIAtlas mappings are templates until pointed at the deployed views | SQL mapping, scaling, knowledge-time stamping into the point-in-time stores |

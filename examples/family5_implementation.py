@@ -33,7 +33,7 @@ from nautilus_fi.propose import (
     reconcile_positions,
     write_orders,
     write_port_upload,
-    write_prep_report,
+    write_pretrade_report,
 )
 from nautilus_fi.synthetic import SyntheticMarketConfig, generate_synthetic_market
 
@@ -60,10 +60,10 @@ def main() -> None:
     target = paper.weights[paper.weights["date"] == paper.weights["date"].max()].set_index("instrument_id")["weight"]
     cash = float(impl.nav["cash"].iloc[-1])
     prop = build_proposal(target, holdings, prices, env.bonds, cash, d, portfolio="FI-CORE", constraints=spec.construction.constraints, spec_hash=spec.hash)
-    write_orders(prop, out / "crd_orders.csv")
-    write_orders(prop, out / "qoe_orders.csv", QOE_ORDERS)
+    write_orders(prop, out / "crd_orders.csv", blocked_ok=True)                 # written for review even when a check blocks sending
+    write_orders(prop, out / "qoe_orders.csv", QOE_ORDERS, blocked_ok=True)
     write_port_upload(prop, out / "port_upload.csv", env.bonds)
-    write_prep_report(prop, out / "prep_validation.csv")
+    write_pretrade_report(prop, out / "pretrade_checks.csv")
     print(f"proposal: {prop.summary()}")
     print(f"files: {sorted(p.name for p in out.iterdir())}")
     after = prop.holdings_after.set_index("symbol")["face"]

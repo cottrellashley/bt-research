@@ -33,9 +33,9 @@ from nautilus_fi.synthetic import SyntheticMarketConfig, generate_synthetic_mark
 def main() -> None:
     root = Path("output/family6")
     shutil.rmtree(root, ignore_errors=True)
-    ledger, registry = TrialLedger(root / "ledger"), RecordRegistry(root / "records")
+    ledger, registry = TrialLedger(root / "ledger"), RecordRegistry(root / "records", min_years=0.5)     # a nine-month window: the track-record threshold (default one year) is the team's to set
     hyp = "F6-WIDE"
-    ledger.register(Hypothesis(hyp, "wide spreads compensate beyond their risk", "IG corporates", "BME 16:45", "OAS rank", "none", 50e6, "12% names", "1m", "NET_SPREAD", "IR < 0.3", ("2023-01-01", "2023-06-30"), ("2023-07-01", "2023-09-29"), ("2030-01-01", "2030-12-31")))
+    ledger.register(Hypothesis(hyp, "wide spreads compensate beyond their risk", "IG corporates", "BME 16:45", "OAS rank", "none", 50e6, "12% names", "1m", "NET_SPREAD", "sharpe < 0.3", ("2023-01-01", "2023-06-30"), ("2023-07-01", "2023-09-29"), ("2030-01-01", "2030-12-31")))
     cfg = SyntheticMarketConfig(start=date(2023, 1, 3), end=date(2023, 9, 29), n_treasuries=3, n_bills=0, n_ig=24, n_hy=0, n_frn=0, n_mbs=0, n_linkers=0, n_frn_arrears=0, n_loans=0, n_hybrids=0, n_munis=0, n_em_sov=0, n_eur_corp=0, n_cp=0, clo_deal=False, abs_deal=False, cmbs_deal=False, default_one_hy=False)
     env = generate_synthetic_market(cfg).build_environment()
     data = paper_data_from_environment(env)
@@ -55,7 +55,7 @@ def main() -> None:
     impl = FixedIncomeBacktest(env, SpecStrategy(spec, SpecStrategyConfig(rebalance="BME", universe_from_benchmark=False)), NET_SPREAD, settings=BacktestSettings(starting_cash=50e6, conventions=conv, hypothesis=hyp)).run()
     ledger.record_result(impl, spec, stage="IMPLEMENT", hypothesis_id=hyp)
     rec = reconcile(best, impl, data.panel)
-    official = registry.submit(RecordLevel.OFFICIAL, best, spec, ledger, implement=impl, reconciliation=rec.summary, data_hashes={d.name: d.content_hash for d in impl.manifest.data_versions})
+    official = registry.submit(RecordLevel.OFFICIAL, best, spec, ledger, implement=impl, reconciliation=rec.summary, data_hashes={d.name: d.content_hash for d in impl.manifest.data_versions}, point_in_time=True)     # a synthetic market is generated once, never revised
     print(f"OFFICIAL {official.record_id}: implemented {official.implement['total_return']:+.2%} vs paper {official.paper['total_return']:+.2%}; chain verified {registry.verify_chain()}; record at {root / 'records' / (official.record_id + '.md')}")
 
 

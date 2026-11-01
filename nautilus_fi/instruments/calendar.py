@@ -1,7 +1,8 @@
 """Business day calendars.
 
-A deliberately small implementation: weekends plus an explicit holiday set, with a generator for the
-US bond market (SIFMA-style) holidays. Supply your own holiday lists for other markets.
+A deliberately small implementation: weekends plus an explicit holiday set, with generators for the
+US bond market (SIFMA-style), TARGET (euro-area settlement) and UK (England and Wales bank holiday)
+calendars. Supply your own holiday lists for other markets.
 """
 
 from __future__ import annotations
@@ -66,6 +67,35 @@ def us_bond_market_holidays(year: int) -> set[date]:
     if year >= 2022:
         hol.add(_observed(date(year, 6, 19)))   # Juneteenth
     return hol
+
+
+def target_holidays(year: int) -> set[date]:
+    """TARGET2 closing days (euro-area payments and government bond settlement): New Year,
+    Good Friday, Easter Monday, 1 May, Christmas Day and 26 December."""
+    e = _easter(year)
+    return {date(year, 1, 1), e - timedelta(days=2), e + timedelta(days=1), date(year, 5, 1), date(year, 12, 25), date(year, 12, 26)}
+
+
+_UK_MOVED = {1995: {"early_may": date(1995, 5, 8)}, 2002: {"spring": date(2002, 6, 4)}, 2012: {"spring": date(2012, 6, 4)}, 2020: {"early_may": date(2020, 5, 8)}, 2022: {"spring": date(2022, 6, 2)}}
+_UK_EXTRA = {date(1999, 12, 31), date(2002, 6, 3), date(2011, 4, 29), date(2012, 6, 5), date(2022, 6, 3), date(2022, 9, 19), date(2023, 5, 8)}
+
+
+def uk_bank_holidays(year: int) -> set[date]:
+    """England and Wales bank holidays, with weekend substitutes and the one-off days since 1995
+    (jubilees, royal weddings and funerals, the coronation)."""
+    e = _easter(year)
+    moved = _UK_MOVED.get(year, {})
+    ny = date(year, 1, 1)
+    ny = ny + timedelta(days=(7 - ny.weekday()) % 7) if ny.weekday() >= 5 else ny
+    xmas, boxing = date(year, 12, 25), date(year, 12, 26)
+    if xmas.weekday() == 5:                                       # Saturday: Monday and Tuesday
+        xmas, boxing = date(year, 12, 27), date(year, 12, 28)
+    elif xmas.weekday() == 6:                                     # Sunday: Boxing Day Monday, Christmas Tuesday
+        xmas = date(year, 12, 27)
+    elif boxing.weekday() == 5:                                   # Christmas Friday: Boxing Day Monday
+        boxing = date(year, 12, 28)
+    hol = {ny, e - timedelta(days=2), e + timedelta(days=1), moved.get("early_may", _nth_weekday(year, 5, 0, 1)), moved.get("spring", _last_weekday(year, 5, 0)), _last_weekday(year, 8, 0), xmas, boxing}
+    return hol | {d for d in _UK_EXTRA if d.year == year}
 
 
 @dataclass
@@ -139,15 +169,28 @@ def us_bond_market_calendar(start_year: int = 1990, end_year: int = 2060) -> Bon
     return BondCalendar(name="US_BOND", holidays=hol)
 
 
+def target_calendar(start_year: int = 1999, end_year: int = 2060) -> BondCalendar:
+    return BondCalendar(name="TARGET", holidays=set().union(*[target_holidays(y) for y in range(start_year, end_year + 1)]))
+
+
+def uk_calendar(start_year: int = 1990, end_year: int = 2060) -> BondCalendar:
+    return BondCalendar(name="UK", holidays=set().union(*[uk_bank_holidays(y) for y in range(start_year, end_year + 1)]))
+
+
 _CALENDARS: dict[str, BondCalendar] = {}
 
 
 def get_calendar(name: str | None) -> BondCalendar:
-    """Registry lookup: ``US_BOND`` (SIFMA-style), ``WEEKENDS`` or a user-registered calendar."""
+    """Registry lookup: ``US_BOND`` (SIFMA-style), ``TARGET``, ``UK``, ``WEEKENDS`` or a
+    user-registered calendar."""
     key = (name or "WEEKENDS").upper()
     if key not in _CALENDARS:
         if key == "US_BOND":
             _CALENDARS[key] = us_bond_market_calendar()
+        elif key == "TARGET":
+            _CALENDARS[key] = target_calendar()
+        elif key == "UK":
+            _CALENDARS[key] = uk_calendar()
         elif key == "WEEKENDS":
             _CALENDARS[key] = BondCalendar()
         else:

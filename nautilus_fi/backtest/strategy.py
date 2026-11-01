@@ -37,7 +37,7 @@ class FixedIncomeStrategyConfig(StrategyConfig):
     ``BQE``) or a ``RebalanceCalendar`` (index calendars, explicit dates, ``Triggered``).
     ``start_with_decision``: decide on the first trading day regardless of the calendar."""
 
-    def __init__(self, *, rebalance: str | int | RebalanceCalendar = "M", start_with_decision: bool = True, limit_tolerance_bp: float | None = None, max_order_age_business_days: int | None = None, default_protocol: str = "RFQ", log_decisions: bool = False, cash_buffer: float = 0.01, **_kwargs) -> None:
+    def __init__(self, *, rebalance: str | int | RebalanceCalendar = "BMS", start_with_decision: bool = True, limit_tolerance_bp: float | None = None, max_order_age_business_days: int | None = None, default_protocol: str = "RFQ", log_decisions: bool = False, cash_buffer: float = 0.01, **_kwargs) -> None:
         super().__init__()
         self.rebalance = rebalance
         self.start_with_decision = start_with_decision

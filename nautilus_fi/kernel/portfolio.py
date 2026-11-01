@@ -63,6 +63,14 @@ class KernelCross(CrossSection):
     ctx: object = None
     t: int = -1
     cols: np.ndarray | None = None
+    exits: str = "SELL"                        # held names outside the universe: SELL | EXCLUDE | HOLD_NOT_BUY
+    lb_extra: np.ndarray | None = None         # per-name weight bounds from Bounds / Pin / NoSell / TradeLimit
+    ub_extra: np.ndarray | None = None
+    overlay_data: pd.DataFrame | None = None   # Hedge(joint=True): overlay exposures per unit notional (instrument x field)
+    overlay_current: np.ndarray | None = None  # their current notionals
+    overlay_cost_bp: float = 0.0
+    overlay_max: float | None = None
+    overlay_target: np.ndarray | None = None   # the solved notionals, for the checks
 
     def values(self, x) -> np.ndarray:
         return _cs_values(self, x)
@@ -350,7 +358,7 @@ class TopN(Construction):
 
     def __init__(self, n: int, weighting=None, by=None, invested: float = 1.0, buffer: int = 0) -> None:
         self.n, self.weighting, self.by, self.invested, self.buffer = int(n), as_weighting(weighting), by, float(invested), int(buffer)
-        self.path_dependent = self.buffer > 0
+        self.path_dependent = type(self).path_dependent or self.buffer > 0          # a subclass may run per date anyway
 
     def names(self):
         return self.weighting.names() | _by_names(self.by)
@@ -396,9 +404,14 @@ class Quantile(Construction):
     short bin ``short`` (default none), each leg weighted by ``weighting`` and scaled to
     ``invested`` / ``short_gross``."""
 
-    def __init__(self, n: int = 5, long: int | None = None, short: int | None = None, by=None, weighting=None, invested: float = 1.0, short_gross: float | None = None) -> None:
+    def __init__(self, n: int = 5, long: int | None = None, short: int | None = None, by=None, weighting=None, invested: float = 1.0, short_gross: float | None = None, buffer: int = 0, keep_weights: bool = False) -> None:
+        """``buffer``: a holding stays while within ``buffer`` bins of its leg (fewer trades);
+        ``keep_weights``: names that stay keep their drifted weight, new names share the rest
+        (drift-aware: no trades just to reset weights)."""
         self.n, self.long, self.short, self.by = int(n), long, short, by
         self.weighting, self.invested, self.short_gross = as_weighting(weighting), float(invested), short_gross
+        self.buffer, self.keep_weights = int(buffer), bool(keep_weights)
+        self.path_dependent = type(self).path_dependent or self.buffer > 0 or self.keep_weights
 
     def names(self):
         return self.weighting.names() | _by_names(self.by)
@@ -411,14 +424,37 @@ class Quantile(Construction):
         return np.where(np.isfinite(pct), np.clip(np.ceil(pct * self.n), 1, self.n), 0).astype(np.int32)
 
     def batch(self, B):
+        if (self.buffer or self.keep_weights) and B.current is None:
+            return None
         b = self.bins(B)
-        w = self.weighting.apply(b == (self.long or self.n), B) * self.invested
-        if self.short is not None:
-            w = w - self.weighting.apply(b == self.short, B) * (self.short_gross if self.short_gross is not None else self.invested)
+        top = self.long or self.n
+        long_sel = b == top
+        short_sel = (b == self.short) if self.short is not None else None
+        if self.buffer and B.current is not None:
+            long_sel |= (B.current > 0) & (b >= top - self.buffer) & (b > 0)
+            if short_sel is not None:
+                short_sel |= (B.current < 0) & (b <= self.short + self.buffer) & (b > 0)
+        w = self._leg(long_sel, B, self.invested, B.current if self.keep_weights else None, 1.0)
+        if short_sel is not None:
+            w = w - self._leg(short_sel, B, self.short_gross if self.short_gross is not None else self.invested, B.current if self.keep_weights else None, -1.0)
         return w
+
+    def _leg(self, sel, B, gross, current, sign):
+        base = self.weighting.apply(sel, B) * gross
+        if current is None:
+            return base
+        kept = np.where(sel & (np.sign(current) == sign), np.abs(current), 0.0)
+        room = np.clip(gross - kept.sum(axis=1, keepdims=True), 0.0, None)
+        new = sel & (kept == 0)
+        fresh = self.weighting.apply(new, B)
+        return np.where(kept > 0, kept, fresh * room)
 
     def __repr__(self) -> str:
         parts = [str(self.n)]
+        if self.buffer:
+            parts.append(f"buffer={self.buffer}")
+        if self.keep_weights:
+            parts.append("keep_weights=True")
         if self.long is not None:
             parts.append(f"long={self.long}")
         if self.short is not None:
@@ -983,28 +1019,59 @@ class PCARisk:
 
 
 # ====================================================================================== optimiser: constraints
+def _bound(x):
+    """A constraint bound: a number, or a value resolved at each rebalance (an expression such as a
+    regime-scaled target, or ``fn(cs) -> number``)."""
+    if x is None:
+        return None
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+    if isinstance(x, Expr) or callable(x):
+        return x
+    return float(x)
+
+
+def _resolve_bound(b, cs):
+    if b is None or isinstance(b, float):
+        return b
+    if isinstance(b, Expr):
+        v = np.asarray(_cs_values(cs, b), dtype=np.float64)
+        fin = v[np.isfinite(v)]
+        return float(fin[0]) if len(fin) else None                   # a date series broadcast: one value per date
+    v = b(cs)
+    return None if v is None else float(v)
+
+
 class Measure:
-    """The left-hand side of a constraint; compare it with numbers or ``.within(...)``."""
+    """The left-hand side of a constraint; compare it with numbers or ``.within(...)``. Bounds may
+    be numbers, expressions or ``fn(cs)``, resolved at each rebalance (bounds that change by date)."""
 
     kind = ""
 
     def __le__(self, x) -> Constraint:
-        return Constraint(self, None, float(x))
+        return Constraint(self, None, _bound(x))
 
     def __ge__(self, x) -> Constraint:
-        return Constraint(self, float(x), None)
+        return Constraint(self, _bound(x), None)
 
     def __eq__(self, x) -> Constraint:                 # type: ignore[override]
-        return Constraint(self, float(x), float(x))
+        return Constraint(self, _bound(x), _bound(x))
 
     def __hash__(self) -> int:
         return hash(repr(self))
 
-    def within(self, lower: float, upper: float | None = None) -> Constraint:
+    def within(self, lower, upper=None) -> Constraint:
         """``within(b)``: the symmetric band [-b, b]; ``within(lo, hi)``: [lo, hi]."""
         if upper is None:
-            return Constraint(self, -abs(float(lower)), abs(float(lower)))
-        return Constraint(self, float(lower), float(upper))
+            if isinstance(lower, (int, float, np.integer, np.floating)):
+                return Constraint(self, -abs(float(lower)), abs(float(lower)))
+            return Constraint(self, _NegBound(lower), _bound(lower))
+        return Constraint(self, _bound(lower), _bound(upper))
+
+    def where(self, predicate) -> Subset:
+        """This measure over the names where ``predicate`` holds: ``ActiveWeight("issuer").where(
+        Field("sector") == "BANKING") <= 0`` keeps Banking issuers at or below their index weight."""
+        return Subset(self, predicate)
 
     def spec_kw(self) -> dict:
         return {}
@@ -1164,12 +1231,56 @@ class _MinHold(Measure):
         return "MinHolding"
 
 
+class _NegBound:
+    """``-b`` for a bound resolved per rebalance (``within(expr)``)."""
+
+    def __init__(self, b) -> None:
+        self.b = b
+
+    def __call__(self, cs):
+        v = _resolve_bound(self.b, cs)
+        return None if v is None else -abs(v)
+
+    def __repr__(self) -> str:
+        return f"-{self.b!r}"
+
+
 class Constraint:
-    def __init__(self, measure: Measure, lo: float | None, hi: float | None, hard: bool = True, penalty: float = 100.0) -> None:
-        self.measure, self.lo, self.hi, self.hard, self.penalty = measure, lo, hi, bool(hard), float(penalty)
+    def __init__(self, measure: Measure, lo, hi, hard: bool = True, penalty: float = 100.0, strict: bool = False) -> None:
+        self.measure, self.lo, self.hi, self.hard, self.penalty, self.is_strict = measure, lo, hi, bool(hard), float(penalty), bool(strict)
 
     def soft(self, penalty: float = 100.0) -> Constraint:
         return Constraint(self.measure, self.lo, self.hi, False, penalty)
+
+    def strict(self) -> Constraint:
+        """A limit the relaxation ladder never moves (a mandate rule)."""
+        c = Constraint(self.measure, self.lo, self.hi, self.hard, self.penalty, True)
+        c.min_benchmark_weight = getattr(self, "min_benchmark_weight", None)
+        return c
+
+    def skip_below(self, benchmark_weight: float) -> Constraint:
+        """Group constraints: skip groups the benchmark holds less than ``benchmark_weight`` of."""
+        c = Constraint(self.measure, self.lo, self.hi, self.hard, self.penalty, self.is_strict)
+        c.min_benchmark_weight = float(benchmark_weight)
+        return c
+
+    def at(self, cs) -> Constraint:
+        """This constraint with its bounds resolved for the cross-section's date."""
+        lo, hi = _resolve_bound(self.lo, cs), _resolve_bound(self.hi, cs)
+        if lo is self.lo and hi is self.hi:
+            return self
+        c = Constraint(self.measure, lo, hi, self.hard, self.penalty, self.is_strict)
+        c.min_benchmark_weight = getattr(self, "min_benchmark_weight", None)
+        return c
+
+    def linear_rows(self, cs) -> list:
+        if hasattr(self.measure, "rows"):
+            return self.measure.rows(cs, self.lo, self.hi, self.hard, self.penalty)
+        r = self.linear_row(cs)
+        return [] if r is None else [r]
+
+    def bounds(self, cs):
+        return self.measure.bounds(cs) if hasattr(self.measure, "bounds") else None
 
     @property
     def slot(self) -> tuple:
@@ -1180,12 +1291,12 @@ class Constraint:
 
     def to_spec(self) -> ConstraintSpec | None:
         m = self.measure
-        if isinstance(m, LinearMeasure):
+        if isinstance(m, (LinearMeasure, TEV)) or hasattr(m, "rows") or hasattr(m, "bounds"):
             return None
         kw = {k: v for k, v in m.spec_kw().items() if k not in ("value",) or v is not None}
         if "value" in kw and kw["value"] is None:
             kw.pop("value")
-        return ConstraintSpec(m.kind, self.lo, self.hi, hard=self.hard, penalty=self.penalty, **kw)
+        return ConstraintSpec(m.kind, self.lo, self.hi, hard=self.hard, penalty=self.penalty, strict=self.is_strict, min_benchmark_weight=getattr(self, "min_benchmark_weight", None), **kw)
 
     def linear_row(self, cs) -> LinearRow | None:
         if not isinstance(self.measure, LinearMeasure):
@@ -1194,24 +1305,42 @@ class Constraint:
 
     def __repr__(self) -> str:
         m = self.measure
+        f = (lambda v: f"{v:g}" if isinstance(v, float) else repr(v))
         if isinstance(m, _MinHold):
-            body = f"MinHolding({'' if self.lo is None else f'{self.lo:g}'})"
-        elif self.lo is not None and self.hi is not None and self.lo == self.hi:
-            body = f"{m!r} == {self.lo:g}"
-        elif self.lo is not None and self.hi is not None and self.lo == -self.hi:
-            body = f"{m!r}.within({self.hi:g})"
+            body = f"MinHolding({'' if self.lo is None else f(self.lo)})"
+        elif isinstance(m, _MinTrade):
+            body = f"MinTrade({f(self.lo)})"
+        elif hasattr(m, "bounds") or isinstance(m, _RelCap):
+            body = repr(m)
+        elif self.lo is not None and self.hi is not None and isinstance(self.lo, float) and isinstance(self.hi, float) and self.lo == self.hi:
+            body = f"{m!r} == {f(self.lo)}"
+        elif self.lo is not None and self.hi is not None and isinstance(self.lo, float) and isinstance(self.hi, float) and self.lo == -self.hi:
+            body = f"{m!r}.within({f(self.hi)})"
         elif self.lo is not None and self.hi is not None:
-            body = f"{m!r}.within({self.lo:g}, {self.hi:g})"
+            body = f"{m!r}.within({f(self.lo)}, {f(self.hi)})"
         elif self.hi is not None:
-            body = f"{m!r} <= {self.hi:g}"
+            body = f"{m!r} <= {f(self.hi)}"
         else:
-            body = f"{m!r} >= {self.lo:g}"
-        return body + ("" if self.hard else f".soft({self.penalty:g})")
+            body = f"{m!r} >= {f(self.lo)}"
+        return body + ("" if self.hard else f".soft({self.penalty:g})") + (".strict()" if self.is_strict else "")
 
 
 def MinHolding(min_weight: float | None = None) -> Constraint:
     """Each holding zero or at least ``min_weight`` of NAV (None: the minimum piece at the price)."""
     return Constraint(_MinHold(), None if min_weight is None else float(min_weight), None)
+
+
+class _MinTrade(Measure):
+    kind = "min_trade"
+
+    def __repr__(self) -> str:
+        return "MinTrade"
+
+
+def MinTrade(min_weight: float) -> Constraint:
+    """Each trade zero or at least ``min_weight`` of NAV (semi-continuous trades, a MILP); closing a
+    position smaller than the minimum is allowed."""
+    return Constraint(_MinTrade(), float(min_weight), None)
 
 
 def _replace(old: tuple, new: tuple) -> tuple:
@@ -1225,7 +1354,28 @@ def check_all(constraints, weights: pd.Series, cs: CrossSection) -> list[dict]:
     initial = float(cs.current.abs().sum()) < 1e-9
     specs = []
     out: list[dict] = []
+    wv = weights.reindex(cs.ids).fillna(0.0).to_numpy()
     for c in constraints:
+        c = c.at(cs)
+        if isinstance(c.measure, TEV):
+            sig = c.measure.sigma(cs, wv)
+            if c.hi is not None and sig > c.hi * (1 + 1e-3) + 1e-9:
+                out.append({"constraint": repr(c.measure), "group": None, "value": sig, "bound": c.hi, "side": "max", "severity": "HARD" if c.hard else "SOFT"})
+            continue
+        b = c.bounds(cs)
+        if b is not None:
+            lb, ub = b
+            for i in np.nonzero(((wv < lb - 1e-6) if lb is not None else False) | ((wv > ub + 1e-6) if ub is not None else False))[0]:
+                out.append({"constraint": repr(c.measure), "group": str(cs.ids[i]), "value": float(wv[i]), "bound": float(lb[i] if lb is not None and wv[i] < lb[i] else ub[i]), "side": "min" if lb is not None and wv[i] < lb[i] else "max", "severity": "HARD"})
+            continue
+        if hasattr(c.measure, "rows"):
+            for row in c.linear_rows(cs):
+                v = float(row.coef @ wv)
+                if row.hi is not None and v > row.hi + 1e-6:
+                    out.append({"constraint": row.name, "group": None, "value": v, "bound": row.hi, "side": "max", "severity": "HARD" if row.hard else "SOFT"})
+                if row.lo is not None and v < row.lo - 1e-6:
+                    out.append({"constraint": row.name, "group": None, "value": v, "bound": row.lo, "side": "min", "severity": "HARD" if row.hard else "SOFT"})
+            continue
         spec = c.to_spec()
         if spec is not None:
             if (spec.kind == "turnover" and initial) or (spec.kind == "cvar" and cs.scenarios is None):
@@ -1242,12 +1392,27 @@ def check_all(constraints, weights: pd.Series, cs: CrossSection) -> list[dict]:
 
 
 def _opt_diag(res) -> dict:
-    return {"optimiser": res.summary(), "binding": res.binding[:50], "relaxations": res.relaxations, "ok": res.ok, "message": res.message}
+    out = {"optimiser": res.summary(), "binding": res.binding[:50], "relaxations": res.relaxations, "ok": res.ok, "message": res.message}
+    if getattr(res, "overlays", None) is not None:
+        out["overlays"] = res.overlays                          # solved with the book (Hedge(joint=True))
+    return out
 
 
-def _solve(cs, legacy_objective, constraints, long_only, settings, extras: dict | None = None):
+def _solve(cs, legacy_objective, constraints, long_only, settings, extras: dict | None = None, extra_rows=()):
+    constraints = [c.at(cs) for c in constraints if not isinstance(c.measure, TEV)]
     specs = [s for s in (c.to_spec() for c in constraints) if s is not None]
-    rows = [r for r in (c.linear_row(cs) for c in constraints) if r is not None]
+    rows = [r for c in constraints for r in c.linear_rows(cs)] + list(extra_rows)
+    lb = ub = None
+    for c in constraints:
+        b = c.bounds(cs)
+        if b is not None:
+            lo_, hi_ = b
+            if lo_ is not None:
+                lb = lo_ if lb is None else np.maximum(lb, lo_)
+            if hi_ is not None:
+                ub = hi_ if ub is None else np.minimum(ub, hi_)
+    if lb is not None or ub is not None:
+        cs = dataclasses.replace(cs, lb_extra=lb, ub_extra=ub)
     need_scen = any(s.kind == "cvar" for s in specs) or (extras or {}).get("scenarios") is not None
     if need_scen and cs.scenarios is None:
         prov = (extras or {}).get("scenarios") or next((c.measure.scenarios for c in constraints if isinstance(c.measure, CVaRLimit)), None)
@@ -1256,16 +1421,323 @@ def _solve(cs, legacy_objective, constraints, long_only, settings, extras: dict 
     return optimise(cs, legacy_objective, specs, long_only, settings, rows)
 
 
+# ====================================================================================== optimiser: risk limits, bounds and rows
+def _risk_model(model, cs) -> RiskModel:
+    return model(cs) if callable(model) and not isinstance(model, RiskModel) else model
+
+
+def _risk_matvec(rm: RiskModel, ids, a: np.ndarray) -> np.ndarray:
+    L = rm.loadings.reindex(ids).fillna(0.0).to_numpy(dtype=float)
+    F = rm.factor_cov.to_numpy(dtype=float)
+    spec = rm.specific_var.reindex(ids).fillna(0.0).to_numpy(dtype=float)
+    return L @ (F @ (L.T @ a)) + spec * a
+
+
+class TEV(Measure):
+    """Ex-ante tracking error (``active=True``: of weights minus the benchmark's) or volatility of a
+    factor risk model (a ``RiskModel`` or ``fn(cs) -> RiskModel``, e.g. ``PCARisk``), annualised by
+    ``periods_per_year``. ``TEV(model) <= 0.02`` is a hard limit, solved by outer linearisation
+    (cutting planes on the convex TE function) around the LP / QP."""
+
+    kind = "tev"
+
+    def __init__(self, model, active: bool = True, periods_per_year: float = 252.0) -> None:
+        self.model, self.active, self.periods_per_year = model, bool(active), float(periods_per_year)
+
+    def names(self):
+        return getattr(self.model, "names", lambda: set())()
+
+    def _a(self, cs, w: np.ndarray) -> np.ndarray:
+        return w - (cs.benchmark.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float) if self.active else 0.0)
+
+    def sigma(self, cs, w: np.ndarray, rm: RiskModel | None = None) -> float:
+        rm = rm or _risk_model(self.model, cs)
+        a = self._a(cs, w)
+        return float(np.sqrt(max(a @ _risk_matvec(rm, cs.ids, a), 0.0) * self.periods_per_year))
+
+    def cut(self, cs, w: np.ndarray, limit: float, rm: RiskModel, name: str, hard: bool, penalty: float) -> LinearRow | None:
+        a = self._a(cs, w)
+        Sa = _risk_matvec(rm, cs.ids, a)
+        sig = float(np.sqrt(max(a @ Sa, 0.0) * self.periods_per_year))
+        if sig <= limit * (1 + 1e-3) or sig <= 0:
+            return None
+        g = self.periods_per_year * Sa / sig                              # gradient of the annualised TE in weights
+        base = float(g @ (cs.benchmark.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float))) if self.active else 0.0
+        return LinearRow(g, None, limit + base, name, hard, penalty)
+
+    def __repr__(self) -> str:
+        return f"TEV({self.model!r}{'' if self.active else ', active=False'})"
+
+
+def TargetTE(model, target: float, periods_per_year: float = 252.0) -> Constraint:
+    """A tracking-error budget the alpha objective spends: ``TEV(model) <= target``."""
+    return TEV(model, True, periods_per_year) <= float(target)
+
+
+def _values(v, cs, default=np.nan) -> np.ndarray:
+    """Per-name values on the cross-section: a number, a dict / Series by id, an expression,
+    ``fn(cs)``, or ``"current"`` (the current weights)."""
+    n = len(cs.ids)
+    if v is None:
+        return np.full(n, default)
+    if isinstance(v, str) and v == "current":
+        return cs.current.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float)
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return np.full(n, float(v))
+    if isinstance(v, dict):
+        v = pd.Series(v, dtype=float)
+    if isinstance(v, pd.Series):
+        return v.reindex(cs.ids.astype(str)).to_numpy(dtype=float)
+    if isinstance(v, Expr):
+        return np.asarray(_cs_values(cs, v), dtype=float)
+    return np.asarray(v(cs), dtype=float)
+
+
+def _mask(names, cs) -> np.ndarray:
+    if names is None:
+        return np.ones(len(cs.ids), dtype=bool)
+    if isinstance(names, Expr):
+        return np.nan_to_num(np.asarray(_cs_values(cs, names), dtype=float)) > 0
+    return cs.ids.astype(str).isin([str(x) for x in names])
+
+
+class _Bounds(Measure):
+    kind = "bounds"
+
+    def __init__(self, lo=None, hi=None, names=None, trade=None, label: str = "Bounds") -> None:
+        self.lo_, self.hi_, self.names_, self.trade, self.label = lo, hi, names, trade, label
+
+    def names(self):
+        out = set()
+        for v in (self.lo_, self.hi_, self.names_, self.trade):
+            if isinstance(v, Expr):
+                out |= v.names()
+        return out
+
+    def bounds(self, cs):
+        m = _mask(self.names_, cs)
+        lb = ub = None
+        if self.lo_ is not None:
+            v = _values(self.lo_, cs)
+            lb = np.where(m & np.isfinite(v), v, -np.inf)
+        if self.hi_ is not None:
+            v = _values(self.hi_, cs)
+            ub = np.where(m & np.isfinite(v), v, np.inf)
+        if self.trade is not None:
+            cap = np.abs(_values(self.trade, cs))
+            w0 = cs.current.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float)
+            lo2, hi2 = np.where(m & np.isfinite(cap), w0 - cap, -np.inf), np.where(m & np.isfinite(cap), w0 + cap, np.inf)
+            lb = lo2 if lb is None else np.maximum(lb, lo2)
+            ub = hi2 if ub is None else np.minimum(ub, hi2)
+        return lb, ub
+
+    def __repr__(self) -> str:
+        return self.label
+
+
+def Bounds(lo=None, hi=None, names=None) -> Constraint:
+    """Per-name weight bounds: numbers, ``{id: w}`` / Series, expressions (factor units:
+    ``hi=0.5 / Field("dts")``) or ``fn(cs)``; ``names``: ids or a predicate the bounds apply to."""
+    return Constraint(_Bounds(lo, hi, names, None, f"Bounds(lo={_fmt(lo)}, hi={_fmt(hi)})"), None, None)
+
+
+def Pin(weights) -> Constraint:
+    """Hold these names at exactly these weights (``{id: w}``)."""
+    return Constraint(_Bounds(weights, weights, list(pd.Series(weights).index), None, f"Pin({len(pd.Series(weights))} names)"), None, None)
+
+
+def NoSell(names) -> Constraint:
+    """These names (ids or a predicate) may not be reduced."""
+    return Constraint(_Bounds("current", None, names, None, "NoSell"), None, None)
+
+
+def NoBuy(names) -> Constraint:
+    """These names may not be increased (hold, never buy: grandfathered names)."""
+    return Constraint(_Bounds(None, "current", names, None, "NoBuy"), None, None)
+
+
+def TradeLimit(max_trade, names=None) -> Constraint:
+    """Each name trades at most ``max_trade`` of NAV (a number, or capacity such as
+    ``Field("adv") * 0.1 / nav``); a band that needs a larger trade binds at the capacity."""
+    return Constraint(_Bounds(None, None, names, max_trade, f"TradeLimit({_fmt(max_trade)})"), None, None)
+
+
+def _group_values(cs, group) -> np.ndarray:
+    if group in cs.data.columns:
+        return cs.data[group].astype(str).to_numpy()
+    ctx = getattr(cs, "ctx", None)
+    if ctx is not None:
+        cat = ctx.groups(group)
+        codes = cat.broadcast(ctx.T, ctx.N)[cs.t][cs.cols]
+        labels = np.array([str(x) for x in cat.categories] + ["<none>"])
+        return labels[np.where(codes >= 0, codes, len(labels) - 1)]
+    raise KeyError(f"group {group!r} is not on the cross-section")
+
+
+class Subset(Measure):
+    """A measure restricted to the names where ``predicate`` holds (``Measure.where``)."""
+
+    kind = "subset"
+
+    def __init__(self, inner: Measure, predicate) -> None:
+        self.inner, self.predicate = inner, (Field(predicate) if isinstance(predicate, str) else lift(predicate))
+
+    def names(self):
+        return self.inner.names() | self.predicate.names()
+
+    @property
+    def slot(self):
+        return ("subset", repr(self.inner), repr(self.predicate))
+
+    def rows(self, cs, lo, hi, hard, penalty) -> list:
+        mask = np.nan_to_num(np.asarray(_cs_values(cs, self.predicate), dtype=float)) > 0
+        wb = cs.benchmark.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float)
+        inner = self.inner
+        active = isinstance(inner, (ActiveWeight, ActiveExposure))
+        out = []
+        if isinstance(inner, (GroupWeight, ActiveWeight)) and getattr(inner, "group", None) is not None:
+            g = _group_values(cs, inner.group)
+            for grp in np.unique(g[mask]):
+                if inner.value is not None and str(grp) != str(inner.value):
+                    continue
+                sel = mask & (g == grp)
+                base = float(wb[sel].sum()) if active else 0.0
+                out.append(LinearRow(sel.astype(float), None if lo is None else lo + base, None if hi is None else hi + base, f"{inner!r}[{grp}] where {self.predicate!r}", hard, penalty))
+        elif isinstance(inner, Exposure):
+            x = np.nan_to_num(np.asarray(_cs_values(cs, Field(inner.field)), dtype=float)) * mask
+            base = float(wb @ x) if active else 0.0
+            out.append(LinearRow(x, None if lo is None else lo + base, None if hi is None else hi + base, f"{inner!r} where {self.predicate!r}", hard, penalty))
+        elif isinstance(inner, (Weight, ActiveWeight)):
+            coef = mask.astype(float)
+            base = float(wb[mask].sum()) if active else 0.0
+            out.append(LinearRow(coef, None if lo is None else lo + base, None if hi is None else hi + base, f"total {inner!r} where {self.predicate!r}", hard, penalty))
+        else:
+            raise TypeError(f"{inner!r}.where(...) supports group weights, weights and exposures")
+        return out
+
+    def __repr__(self) -> str:
+        return f"{self.inner!r}.where({self.predicate!r})"
+
+
+class _RelCap(Measure):
+    kind = "relcap"
+
+    def __init__(self, group: str, absolute: float, relative: float, floor: float | None = None) -> None:
+        self.group, self.absolute, self.relative, self.floor = group, float(absolute), float(relative), floor
+
+    def names(self):
+        return {self.group}
+
+    @property
+    def slot(self):
+        return ("relcap", self.group)
+
+    def rows(self, cs, lo, hi, hard, penalty) -> list:
+        g = _group_values(cs, self.group)
+        wb = cs.benchmark.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float)
+        out = []
+        for grp in np.unique(g):
+            sel = g == grp
+            cap = min(self.absolute, self.relative * float(wb[sel].sum()))
+            if self.floor is not None:
+                cap = max(cap, float(self.floor))
+            out.append(LinearRow(sel.astype(float), None, cap, f"{self!r}[{grp}]", hard, penalty))
+        return out
+
+    def __repr__(self) -> str:
+        return f"GroupWeight({self.group!r}).cap(absolute={self.absolute:g}, relative={self.relative:g}{'' if self.floor is None else f', floor={self.floor:g}'})"
+
+
+class CurrencyExposure(Measure):
+    """Exposure to a currency, counting cash in the base currency: ``sum(w where currency == c)``
+    plus the cash weight when ``c`` is the base currency."""
+
+    kind = "currency"
+
+    def __init__(self, currency: str, base: str = "USD", field: str = "currency") -> None:
+        self.currency, self.base, self.field = str(currency), str(base), field
+
+    def names(self):
+        return {self.field}
+
+    @property
+    def slot(self):
+        return ("currency", self.currency)
+
+    def rows(self, cs, lo, hi, hard, penalty) -> list:
+        ccy = _group_values(cs, self.field)
+        if self.currency == self.base:                                   # 1 - sum(w) + sum(w in base) = 1 - sum(w not in base)
+            coef = -(ccy != self.currency).astype(float)
+            return [LinearRow(coef, None if lo is None else lo - 1.0, None if hi is None else hi - 1.0, repr(self), hard, penalty)]
+        return [LinearRow((ccy == self.currency).astype(float), lo, hi, repr(self), hard, penalty)]
+
+    def __repr__(self) -> str:
+        return f"CurrencyExposure({self.currency!r}{'' if self.base == 'USD' else f', base={self.base!r}'})"
+
+
+class AnnualTurnoverBudget:
+    """A per-rebalance turnover bound from an annual target: a ``month_end_share`` of the monthly
+    budget at month ends and the rest spread over ``events_per_month`` interim events (Erin Beta+).
+    Use as a bound: ``Turnover() <= AnnualTurnoverBudget(1.2)``."""
+
+    def __init__(self, annual: float, month_end_share: float = 0.4, events_per_month: int = 3) -> None:
+        self.annual, self.share, self.events = float(annual), float(month_end_share), int(events_per_month)
+
+    def __call__(self, cs) -> float:
+        monthly = self.annual / 12.0
+        dates = cs.ctx.panel.dates
+        t = cs.t
+        month_end = t + 1 >= len(dates) or dates[t + 1].month != dates[t].month
+        return monthly * self.share if month_end else monthly * (1.0 - self.share) / max(self.events, 1)
+
+    def __repr__(self) -> str:
+        return f"AnnualTurnoverBudget({self.annual:g}, month_end_share={self.share:g})"
+
+
+class IndexTurnover:
+    """A turnover bound that follows the index: half the sum of the benchmark's weight changes over
+    the last ``window`` rows, plus a discretionary ``allowance``: ``Turnover() <= IndexTurnover(ix, allowance=0.02)``."""
+
+    def __init__(self, benchmark, window: int = 21, allowance: float = 0.0) -> None:
+        self.benchmark, self.window, self.allowance = benchmark, int(window), float(allowance)
+
+    def __call__(self, cs) -> float:
+        W = self.benchmark.weights(cs.ctx)
+        t = cs.t
+        k = max(0, t - self.window)
+        return float(0.5 * np.abs(W[t] - W[k]).sum() + self.allowance)
+
+    def __repr__(self) -> str:
+        return f"IndexTurnover({self.benchmark!r}, allowance={self.allowance:g})"
+
+
+def _cap(self, absolute: float, relative: float, floor: float | None = None) -> Constraint:
+    """Each group at most ``min(absolute, relative x its index weight)`` (``floor``: at least this
+    cap, for names outside the index)."""
+    return Constraint(_RelCap(self.group, absolute, relative, floor), None, None)
+
+
+GroupWeight.cap = _cap
+
+
+
 class Optimise(Construction):
     """An LP / MILP / QP over trades, solved by HiGHS: maximise the objective subject to the
     constraints (fully invested by default when long-only)."""
 
     path_dependent = True
+    handles_exits = True                       # applies the strategy's exit policy to held names outside the universe
 
-    def __init__(self, objective=None, *constraints: Constraint, long_only: bool = True, settings: OptimiserSettings | None = None, constraints_: Iterable[Constraint] | None = None) -> None:
+    def __init__(self, objective=None, *constraints: Constraint, long_only: bool = True, settings: OptimiserSettings | None = None, constraints_: Iterable[Constraint] | None = None, tie_break=None, tie_tolerance: float = 1e-6, tev_iterations: int = 30) -> None:
+        """``tie_break``: a second objective (``-ActiveShare()``, ``-Risk(model)``, ``-Linear(issuer_dts)``)
+        minimised at no loss in the first stage's objective (within ``tie_tolerance``, relative).
+        ``TEV(model) <= x`` limits are solved by cutting planes, at most ``tev_iterations`` re-solves."""
         if isinstance(objective, Constraint):
             constraints = (objective, *constraints)
             objective = None
+        if isinstance(tie_break, Term):
+            tie_break = Objective(((1.0, tie_break),))
+        self.tie_break, self.tie_tolerance, self.tev_iterations = tie_break, float(tie_tolerance), int(tev_iterations)
         if isinstance(objective, Term):
             objective = Objective(((1.0, objective),))
         self.objective = objective if objective is not None else Objective(((1.0, Alpha()), (-1.0, Costs())))
@@ -1291,16 +1763,84 @@ class Optimise(Construction):
         if model is not None and getattr(cs, "ctx", None) is not None:
             unit = model.linear(cs.ctx, cs.t, cs.nav)[cs.cols]
             cs = dataclasses.replace(cs, cost_bp=pd.Series(unit * 1e4, index=cs.ids))
-        res = _solve(cs, legacy, self.constraints_, self.long_only, self.settings, extras)
-        return res.weights[res.weights.abs() > 1e-12], _opt_diag(res)
+        res, cuts, tev = self._solve_with_limits(cs, legacy, extras, ())
+        diag = _opt_diag(res)
+        if tev:
+            diag["tev"] = tev
+        if self.tie_break is not None and res.ok and vec is not None:
+            w1 = res.weights.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float)
+            score = float(vec @ w1)
+            keep = LinearRow(vec, score - self.tie_tolerance * max(abs(score), 1e-12), None, "tie-break: first-stage objective kept", True, 0.0)
+            legacy2, vec2, extras2 = self.tie_break.compile(cs)
+            cs2 = dataclasses.replace(cs, scores=pd.Series(vec2 if vec2 is not None else np.zeros(len(cs.ids)), index=cs.ids))
+            res2, _, _ = self._solve_with_limits(cs2, legacy2, extras2, (*cuts, keep))
+            if res2.ok:
+                diag["tie_break"] = {"first_stage_score": score, "second_stage_score": float(vec @ res2.weights.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float)), "objective": repr(self.tie_break)}
+                res = res2
+        return res.weights[res.weights.abs() > 1e-12], diag
+
+    def _solve_with_limits(self, cs, legacy, extras, extra_rows):
+        """Solve, then add a cutting plane for each TE / risk limit the solution breaches, until
+        every limit holds (or ``tev_iterations`` re-solves)."""
+        tevs = [c.at(cs) for c in self.constraints_ if isinstance(c.measure, TEV)]
+        cuts = list(extra_rows)
+        res = _solve(cs, legacy, self.constraints_, self.long_only, self.settings, extras, cuts)
+        if not tevs:
+            return res, cuts, None
+        models = [_risk_model(c.measure.model, cs) for c in tevs]
+        integer = any(c.measure.kind in ("cardinality", "min_holding", "min_trade") for c in self.constraints_)
+        if len(tevs) == 1 and tevs[0].hi is not None and legacy.risk is None and not integer:
+            return self._bisect_tev(cs, legacy, extras, cuts, tevs[0], models[0], res)
+        it = 0
+        while res.ok and it < self.tev_iterations:
+            w = res.weights.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float)
+            new = [c.measure.cut(cs, w, c.hi, rm, f"{c.measure!r} cut {it}", c.hard, c.penalty) for c, rm in zip(tevs, models, strict=True) if c.hi is not None]
+            new = [r for r in new if r is not None]
+            if not new:
+                break
+            cuts += new
+            res = _solve(cs, legacy, self.constraints_, self.long_only, self.settings, extras, cuts)
+            it += 1
+        w = res.weights.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float)
+        tev = {repr(c.measure): {"limit": c.hi, "value": c.measure.sigma(cs, w, rm), "cuts": it} for c, rm in zip(tevs, models, strict=True)}
+        return res, cuts, tev
+
+    def _bisect_tev(self, cs, legacy, extras, cuts, c, rm, res0):
+        """One TE limit: the risk-aversion multiplier of ``a' S a`` (a QP) bisected to the smallest
+        value whose solution meets the limit; on the Lagrangian path of the constrained problem."""
+        m = c.measure
+        sig = lambda r: m.sigma(cs, r.weights.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float), rm)
+        limit = float(c.hi)
+        if not res0.ok or sig(res0) <= limit * (1 + 1e-3):
+            return res0, cuts, {repr(m): {"limit": limit, "value": sig(res0) if res0.ok else float("nan"), "aversion": 0.0}}
+        solve = lambda lam: _solve(cs, dataclasses.replace(legacy, risk=dataclasses.replace(rm, aversion=lam, active=m.active)), self.constraints_, self.long_only, self.settings, extras, cuts)
+        lo, hi = 0.0, 1.0
+        best = solve(hi)
+        while best.ok and sig(best) > limit and hi < 1e18:
+            lo, hi = hi, hi * 10.0
+            best = solve(hi)
+        n = 0
+        while best.ok and n < 40 and (hi - lo) > 1e-4 * hi:
+            mid = np.sqrt(lo * hi) if lo > 0 else hi / 10.0
+            r = solve(mid)
+            if r.ok and sig(r) <= limit:
+                hi, best = mid, r
+            else:
+                lo = mid
+            n += 1
+        return best, cuts, {repr(m): {"limit": limit, "value": sig(best) if best.ok else float("nan"), "aversion": hi, "solves": n}}
 
     # ------------------------------------------------------------------ variants
+    def _same(self, objective, constraints, **kw) -> Optimise:
+        base = {"long_only": self.long_only, "settings": self.settings, "tie_break": self.tie_break, "tie_tolerance": self.tie_tolerance, "tev_iterations": self.tev_iterations}
+        return Optimise(objective, *constraints, **{**base, **kw})
+
     def replace(self, *constraints: Constraint) -> Optimise:
         """Swap constraints in the same slot (``Turnover() <= 0.05`` replaces the turnover limit)."""
-        return Optimise(self.objective, *_replace(self.constraints_, constraints), long_only=self.long_only, settings=self.settings)
+        return self._same(self.objective, _replace(self.constraints_, constraints))
 
     def add(self, *constraints: Constraint) -> Optimise:
-        return Optimise(self.objective, *self.constraints_, *constraints, long_only=self.long_only, settings=self.settings)
+        return self._same(self.objective, (*self.constraints_, *constraints))
 
     def without(self, *measures) -> Optimise:
         """Drop constraints by measure class (``Turnover``) or slot of an example constraint."""
@@ -1311,24 +1851,302 @@ class Optimise(Construction):
                 if isinstance(m, Constraint) and m.slot == c.slot:
                     return True
             return False
-        return Optimise(self.objective, *[c for c in self.constraints_ if not drop(c)], long_only=self.long_only, settings=self.settings)
+        return self._same(self.objective, [c for c in self.constraints_ if not drop(c)])
 
     def with_objective(self, objective) -> Optimise:
-        return Optimise(objective, *self.constraints_, long_only=self.long_only, settings=self.settings)
+        return self._same(objective, self.constraints_)
 
     def with_settings(self, **changes) -> Optimise:
-        return Optimise(self.objective, *self.constraints_, long_only=self.long_only, settings=dataclasses.replace(self.settings, **changes))
+        return self._same(self.objective, self.constraints_, settings=dataclasses.replace(self.settings, **changes))
 
     def with_(self, **changes) -> Optimise:
-        kw = {"objective": self.objective, "long_only": self.long_only, "settings": self.settings, **changes}
+        kw = {"objective": self.objective, "long_only": self.long_only, "settings": self.settings, "tie_break": self.tie_break, "tie_tolerance": self.tie_tolerance, "tev_iterations": self.tev_iterations, **changes}
         cons = changes.get("constraints", self.constraints_)
         kw.pop("constraints", None)
         return Optimise(kw.pop("objective"), *cons, **kw)
 
     def __repr__(self) -> str:
         cons = ", ".join(repr(c) for c in self.constraints_)
-        extra = "" if self.long_only else ", long_only=False"
+        extra = ("" if self.long_only else ", long_only=False") + ("" if self.tie_break is None else f", tie_break={self.tie_break!r}")
         return f"Optimise({self.objective!r}{', ' + cons if cons else ''}{extra})"
+
+
+class Stratified(Construction):
+    """The rule-based index constructor: cells from ``cells`` (``(field, edges)`` bucketed, or a
+    category name: maturity x rating, sector ...), each cell given its benchmark weight and filled
+    with its ``per_cell`` best names by the signal (the pecking order), weighted ``weighting``
+    within the cell. Combine with ``.cap(issuer=...)`` for issuer caps and ``.subject_to(...)`` for
+    duration / KRD matching."""
+
+    needs_scores = True
+
+    def __init__(self, cells=(("years_to_maturity", (3.0, 5.0, 7.0, 10.0)), ("rating_score", (4.5, 7.5, 10.5))), per_cell: int = 3, weighting=None) -> None:
+        self.cells, self.per_cell, self.weighting = tuple(cells), int(per_cell), as_weighting(weighting)
+
+    def names(self):
+        out = set()
+        for c in self.cells:
+            out.add(c[0] if isinstance(c, (tuple, list)) else c)
+        return out | self.weighting.names()
+
+    def _codes(self, cs) -> np.ndarray:
+        keys = []
+        for c in self.cells:
+            if isinstance(c, (tuple, list)):
+                v = np.asarray(_cs_values(cs, Field(c[0])), dtype=float)
+                keys.append(np.where(np.isfinite(v), np.digitize(v, c[1]), -1).astype(str))
+            else:
+                keys.append(_group_values(cs, c))
+        return np.array(["|".join(t) for t in zip(*keys, strict=True)]) if keys else np.full(len(cs.ids), "ALL")
+
+    def weights(self, cs):
+        codes = self._codes(cs)
+        wb = cs.benchmark.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float)
+        sc = cs.scores.reindex(cs.ids).to_numpy(dtype=float) if cs.scores is not None else np.zeros(len(cs.ids))
+        el = cs.eligible.reindex(cs.ids).fillna(False).to_numpy(dtype=bool)
+        out = np.zeros(len(cs.ids))
+        filled, empty = 0, []
+        for cell in np.unique(codes):
+            m = codes == cell
+            target = float(wb[m].sum())
+            if target <= 0:
+                continue
+            cand = np.nonzero(m & el & np.isfinite(sc))[0]
+            if not len(cand):
+                empty.append(cell)
+                continue
+            pick = cand[np.argsort(-sc[cand], kind="stable")[: self.per_cell]]
+            sel = np.zeros(len(cs.ids), dtype=bool)
+            sel[pick] = True
+            ww = self.weighting.apply(sel[None, :], Batch.from_cs(cs))[0]
+            out += ww / ww.sum() * target if ww.sum() > 0 else 0.0
+            filled += 1
+        if empty and out.sum() > 0:                                      # cells without a candidate: their weight spread pro rata
+            out *= float(wb.sum()) / out.sum()
+        w = pd.Series(out, index=cs.ids)
+        return w[w.abs() > 1e-15], {"method": "Stratified", "cells_filled": filled, "cells_empty": len(empty)}
+
+    def __repr__(self) -> str:
+        return f"Stratified(cells={list(self.cells)!r}, per_cell={self.per_cell})"
+
+
+class ZScoreRule(Construction):
+    """A z-score state machine per name over the signal's path: enter short when ``z >= entry`` and
+    long when ``z <= -entry`` (mean reversion), exit when ``|z| <= exit``, stop out when ``|z| >= stop``
+    (and stay out until z returns inside ``exit``), and close after ``max_hold`` rows. Positions are
+    ``size`` each (or ``size / count`` with ``normalise``). ``z``: the z-score expression (default
+    the strategy's signal is not enough: the path is needed, so give it)."""
+
+    needs_scores = False
+
+    def __init__(self, z, entry: float = 2.0, exit: float = 0.5, stop: float | None = 4.0, max_hold: int | None = None, size: float = 0.1, normalise: bool = False, sign: float = -1.0) -> None:
+        self.z = Field(z) if isinstance(z, str) else lift(z)
+        self.entry, self.exit, self.stop, self.max_hold = float(entry), float(exit), stop, max_hold
+        self.size, self.normalise, self.sign = float(size), bool(normalise), float(sign)
+
+    def names(self):
+        return self.z.names()
+
+    def positions(self, ctx) -> np.ndarray:
+        key = f"{ctx.token}|zrule:{self.z.key}:{self.entry}:{self.exit}:{self.stop}:{self.max_hold}"
+        hit = ctx.cache.get(key)
+        if hit is not None:
+            return hit
+        Z = np.asarray(self.z.evaluate(ctx.full()), dtype=float)
+        T, N = Z.shape
+        pos = np.zeros((T, N))
+        cur = np.zeros(N)
+        age = np.zeros(N, dtype=np.int64)
+        locked = np.zeros(N, dtype=bool)
+        for t in range(T):
+            z = Z[t]
+            fin = np.isfinite(z)
+            az = np.abs(np.where(fin, z, 0.0))
+            locked &= ~(fin & (az <= self.exit))
+            stopped = (cur != 0) & fin & ((az >= self.stop) if self.stop is not None else False)
+            expired = (cur != 0) & ((age >= self.max_hold) if self.max_hold else False)
+            close = (cur != 0) & (~fin | (az <= self.exit)) | stopped | expired
+            locked |= (stopped | expired) & ~(fin & (az <= self.exit))   # out until z is back inside the exit band
+            cur = np.where(close, 0.0, cur)
+            age = np.where(cur != 0, age + 1, 0)                          # rows held, this one included
+            enter = (cur == 0) & fin & (az >= self.entry) & ~locked & ~close
+            if self.stop is not None:
+                enter &= az < self.stop
+            cur = np.where(enter, self.sign * np.sign(z), cur)
+            age = np.where(enter, 1, age)
+            pos[t] = cur
+        ctx.cache.put(key, pos)
+        return pos
+
+    def batch(self, B):
+        if B.ctx is None or B.rows is None:
+            return None
+        P = self.positions(B.ctx)[B.rows]
+        if B.cols is not None:
+            P = P[:, B.cols]
+        P = np.where(B.universe | (P != 0), P, 0.0)
+        if self.normalise:
+            k = np.abs(P).sum(axis=1, keepdims=True)
+            return np.where(k > 0, P / np.where(k > 0, k, 1.0), 0.0) * self.size
+        return P * self.size
+
+    def __repr__(self) -> str:
+        return f"ZScoreRule({self.z!r}, entry={self.entry:g}, exit={self.exit:g}, stop={self.stop}, max_hold={self.max_hold})"
+
+
+_ACTION_RANK = {"sell": 0, "exclude": 1, "underweight": 2, "softexclude": 3, "hold": 4, "noaction": 5, "buymax": 6, "buy": 7}
+
+
+class Rules(Construction):
+    """Per-name actions on top of a construction, by precedence (sell > exclude > underweight >
+    softexclude > hold > noaction > buymax > buy, as paperport and Erin Beta+ apply them):
+    ``Rules(base, [(Field("rating_score") > 13, "sell"), (Field("esg_flag") > 0, "exclude"),
+    (Field("watch") > 0, "softexclude"), (Field("liquidity") < 1, ("buymax", 0.01))])``.
+    sell / exclude: zero; underweight: at most the benchmark weight; softexclude: no more than now;
+    hold / noaction: the current weight; buymax x: at most x; buy x: x. The other names absorb the
+    difference pro rata (long-only). The construction log counts each action."""
+
+    path_dependent = True
+
+    def __init__(self, base: Construction, rules) -> None:
+        self.base = as_construction(base) if not isinstance(base, Construction) else base
+        self.rules = tuple((lift(p) if not isinstance(p, Expr) else p, a) for p, a in rules)
+        self.needs_scores = self.base.needs_scores
+        for _, a in self.rules:
+            name = a[0] if isinstance(a, tuple) else a
+            if name not in _ACTION_RANK:
+                raise ValueError(f"unknown rule action {name!r}; known: {sorted(_ACTION_RANK)}")
+
+    def constraints(self):
+        return self.base.constraints()
+
+    def names(self):
+        return self.base.names() | set().union(*[p.names() for p, _ in self.rules]) if self.rules else self.base.names()
+
+    def weights(self, cs):
+        w, diag = self.base.weights(cs)
+        ids = cs.ids
+        wv = w.reindex(ids).fillna(0.0).to_numpy(dtype=float)
+        w0 = cs.current.reindex(ids).fillna(0.0).to_numpy(dtype=float)
+        wb = cs.benchmark.reindex(ids).fillna(0.0).to_numpy(dtype=float)
+        rank = np.full(len(ids), 99)
+        act = np.array([""] * len(ids), dtype=object)
+        arg = np.full(len(ids), np.nan)
+        for pred, a in self.rules:
+            name, x = (a if isinstance(a, tuple) else (a, np.nan))
+            hit = np.nan_to_num(np.asarray(_cs_values(cs, pred), dtype=float)) > 0
+            better = hit & (_ACTION_RANK[name] < rank)
+            rank = np.where(better, _ACTION_RANK[name], rank)
+            act = np.where(better, name, act)
+            arg = np.where(better, x, arg)
+        out = wv.copy()
+        fixed = act != ""
+        out = np.where((act == "sell") | (act == "exclude"), 0.0, out)
+        out = np.where(act == "underweight", np.minimum(out, wb), out)
+        out = np.where(act == "softexclude", np.minimum(out, np.maximum(w0, 0.0)), out)
+        out = np.where((act == "hold") | (act == "noaction"), w0, out)
+        out = np.where(act == "buymax", np.minimum(out, arg), out)
+        out = np.where(act == "buy", arg, out)
+        free = ~fixed & (out > 0)
+        if (wv >= 0).all() and free.any():
+            room = float(wv.sum()) - float(out[fixed].sum())
+            tot = float(out[free].sum())
+            out[free] *= max(room, 0.0) / tot if tot > 0 else 0.0
+        counts = {k: int((act == k).sum()) for k in _ACTION_RANK if (act == k).any()}
+        res = pd.Series(out, index=ids)
+        return res[res.abs() > 1e-15], {**{k: v for k, v in diag.items() if not k.startswith("_")}, **{f"rule_{k}": v for k, v in counts.items()}}
+
+    def __repr__(self) -> str:
+        return f"Rules({self.base!r}, {len(self.rules)} rules)"
+
+
+class MaxIR(Construction):
+    """The highest information ratio along the tracking-error frontier: ``base`` solved under
+    ``TEV(model) <= level`` for each level, keeping the one with the best ex-ante alpha per unit
+    of TE (``active=False``: the best Sharpe, on volatility). MaxSharpe is ``MaxIR(..., active=False)``."""
+
+    path_dependent = True
+    handles_exits = True
+
+    def __init__(self, base: Optimise, model, levels=(0.0025, 0.005, 0.01, 0.015, 0.02, 0.03, 0.05), active: bool = True, periods_per_year: float = 252.0) -> None:
+        self.base, self.model, self.levels, self.active, self.periods_per_year = base, model, tuple(float(x) for x in levels), bool(active), float(periods_per_year)
+        self.needs_scores = base.needs_scores
+
+    def constraints(self):
+        return self.base.constraints()
+
+    def names(self):
+        return self.base.names() | getattr(self.model, "names", lambda: set())()
+
+    def weights(self, cs):
+        _, vec, _ = self.base.objective.compile(cs)
+        alpha = vec if vec is not None else np.nan_to_num(cs.scores.to_numpy(dtype=float)) if cs.scores is not None else np.zeros(len(cs.ids))
+        wb = cs.benchmark.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float) if self.active else 0.0
+        rows, best = [], None
+        for lv in self.levels:
+            w, d = self.base.add(TEV(self.model, self.active, self.periods_per_year) <= lv).weights(cs)
+            wv = w.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float)
+            te = TEV(self.model, self.active, self.periods_per_year).sigma(cs, wv)
+            ir = float(alpha @ (wv - wb)) / te if te > 1e-12 else float("-inf")
+            rows.append({"level": lv, "te": te, "ratio": ir, "ok": d.get("ok", True)})
+            if d.get("ok", True) and (best is None or ir > best[0]):
+                best = (ir, w, d, lv)
+        if best is None:
+            w, d = self.base.weights(cs)
+            return w, {**d, "frontier": rows}
+        return best[1], {**best[2], "frontier": rows, "chosen_te": best[3], "ratio": best[0]}
+
+    def __repr__(self) -> str:
+        return f"MaxIR({self.base!r}, levels={list(self.levels)}{'' if self.active else ', active=False'})"
+
+
+def MaxSharpe(base: Optimise, model, levels=(0.02, 0.04, 0.06, 0.08, 0.1, 0.15), periods_per_year: float = 252.0) -> MaxIR:
+    return MaxIR(base, model, levels, active=False, periods_per_year=periods_per_year)
+
+
+class Sparse(Construction):
+    """Hit a holdings band with reweighted L1: ``base`` re-solved with a penalty ``lam / (|w| + eps)``
+    on each weight, ``lam`` doubled while there are too many names and halved while too few (an
+    adaptive-lambda IRL1, not a cardinality MILP)."""
+
+    path_dependent = True
+    handles_exits = True
+
+    def __init__(self, base: Optimise, names=(40, 60), iterations: int = 12, eps: float = 1e-4, lam: float | None = None) -> None:
+        self.base, self.band, self.iterations, self.eps, self.lam = base, (int(names[0]), int(names[1])), int(iterations), float(eps), lam
+        self.needs_scores = base.needs_scores
+
+    def constraints(self):
+        return self.base.constraints()
+
+    def names(self):
+        return self.base.names()
+
+    def weights(self, cs):
+        _, vec, _ = self.base.objective.compile(cs)
+        scale = float(np.nanmax(np.abs(vec))) if vec is not None and np.isfinite(vec).any() and np.nanmax(np.abs(vec)) > 0 else 1.0
+        lam = self.lam if self.lam is not None else 1e-3 * scale
+        c = np.ones(len(cs.ids))
+        lo, hi = self.band
+        best, trail = None, []
+        w, d = self.base.weights(cs)
+        for _ in range(self.iterations):
+            k = int((w.abs() > 1e-9).sum())
+            trail.append({"lambda": lam, "names": k})
+            gap = 0 if lo <= k <= hi else (k - hi if k > hi else lo - k)
+            if best is None or gap < best[0]:
+                best = (gap, w, d)
+            if gap == 0:
+                break
+            wv = w.reindex(cs.ids).fillna(0.0).to_numpy(dtype=float)
+            c = 1.0 / (np.abs(wv) + self.eps)
+            lam = lam * 2.0 if k > hi else lam / 2.0
+            pen = Linear(lambda cs_, c=c, lam=lam: -lam * c / c.max(), name="sparsity")
+            w, d = self.base.with_objective(self.base.objective + pen).weights(cs)
+        return best[1], {**best[2], "sparsity": trail}
+
+    def __repr__(self) -> str:
+        return f"Sparse({self.base!r}, names={self.band})"
 
 
 # ====================================================================================== overlays
@@ -1337,7 +2155,19 @@ class Hedge:
     ``targets`` (absolute, or relative to the benchmark with ``active=True``) using overlay
     instruments from the source (futures, CDX, swaps: returns per unit notional + exposures)."""
 
-    def __init__(self, instruments=("TY",), fields=("oad",), targets: dict | None = None, active: bool = False, max_gross: float | None = None, financed: Iterable[str] = (), cost_bp: float = 0.5) -> None:
+    def __init__(self, instruments=("TY",), fields=("oad",), targets: dict | None = None, active: bool = False, max_gross: float | None = None, financed: Iterable[str] = (), cost_bp: float = 0.5, cost_per_contract: float = 0.0, contract_notional: dict | None = None, tolerance: float = 0.0, lot: float | None = None, joint: bool = False) -> None:
+        """``cost_per_contract`` / ``contract_notional`` (per instrument): exchange and tick costs per
+        contract traded; ``tolerance``: leave the hedge unchanged while every target is within this of
+        its exposure; ``lot``: round notionals (fraction of NAV) to this size. ``joint``: the
+        notionals are decision variables of the portfolio's optimiser (an ``Optimise``), solved with
+        the cash book: its exposure limits on ``fields`` count the overlays' exposure, each unit
+        traded costs ``cost_bp``, and ``max_gross`` caps each instrument; ``targets`` are then the
+        optimiser's constraints, not sizing targets."""
+        self.joint = bool(joint)
+        self.cost_per_contract = float(cost_per_contract)
+        self.contract_notional = dict(contract_notional or {})
+        self.tolerance = float(tolerance)
+        self.lot = lot
         self.instruments = tuple(instruments)
         self.fields = tuple(fields)
         self.targets = dict(targets or {})
@@ -1353,7 +2183,39 @@ class Hedge:
         return self._impl.size(weights, cs, overlay_data)
 
     def __repr__(self) -> str:
-        return f"Hedge({list(self.instruments)!r}, fields={list(self.fields)!r}, targets={self.targets!r}{', active=True' if self.active else ''})"
+        return f"Hedge({list(self.instruments)!r}, fields={list(self.fields)!r}, targets={self.targets!r}{', active=True' if self.active else ''}{', joint=True' if self.joint else ''})"
+
+
+class KRDWaterfall(Hedge):
+    """Key-rate hedges sized longest bucket first: each ``(field, instrument)`` pair, from the
+    longest key rate to the shortest, neutralises what is left in its bucket after the longer
+    hedges (whose own KRDs spill into shorter buckets), to ``targets[field]`` (a number or
+    ``fn(cs)``: a regime-adjusted target)."""
+
+    def __init__(self, buckets, targets: dict | None = None, **kw) -> None:
+        self.buckets = tuple(buckets)
+        super().__init__(instruments=tuple(i for _, i in self.buckets), fields=tuple(f for f, _ in self.buckets), targets={}, **kw)
+        self.bucket_targets = dict(targets or {})
+
+    def size(self, weights, cs, overlay_data):
+        w = weights.reindex(cs.ids).fillna(0.0)
+        book = {f: float((w * cs.data[f].reindex(cs.ids).fillna(0.0)).sum()) if f in cs.data else 0.0 for f, _ in self.buckets}
+        notion: dict = {}
+        spill = dict.fromkeys(book, 0.0)
+        for f, inst in self.buckets:
+            tgt = self.bucket_targets.get(f, 0.0)
+            tgt = float(tgt(cs)) if callable(tgt) else float(tgt)
+            per = float(overlay_data.at[inst, f]) if (inst in overlay_data.index and f in overlay_data.columns) else 0.0
+            need = tgt - book[f] - spill[f]
+            n = need / per if per else 0.0
+            notion[inst] = notion.get(inst, 0.0) + n
+            for g, _ in self.buckets:
+                if g in overlay_data.columns and inst in overlay_data.index:
+                    spill[g] += n * float(np.nan_to_num(overlay_data.at[inst, g]))
+        return pd.Series(notion), {"method": "KRDWaterfall", "residual": {f: book[f] + spill[f] for f in book}}
+
+    def __repr__(self) -> str:
+        return f"KRDWaterfall({list(self.buckets)!r})"
 
 
 def _by_names(by) -> set[str]:
@@ -1375,12 +2237,15 @@ def as_construction(x) -> Construction:
 
 
 __all__ = [
+    "TEV",
     "ActiveExposure",
     "ActiveShare",
     "ActiveWeight",
     "Alpha",
+    "AnnualTurnoverBudget",
     "Batch",
     "BenchmarkWeight",
+    "Bounds",
     "Budget",
     "ByBenchmark",
     "ByField",
@@ -1393,6 +2258,7 @@ __all__ = [
     "Constraint",
     "Construction",
     "Costs",
+    "CurrencyExposure",
     "Equal",
     "EqualWeight",
     "Exposure",
@@ -1400,27 +2266,38 @@ __all__ = [
     "Hedge",
     "HistoricalScenarios",
     "Hold",
+    "IndexTurnover",
     "InverseField",
     "KernelCross",
     "Legacy",
     "Leverage",
     "Linear",
     "LinearMeasure",
+    "MaxIR",
+    "MaxSharpe",
     "Measure",
     "MinHolding",
+    "MinTrade",
     "Names",
+    "NoBuy",
+    "NoSell",
     "Objective",
     "Optimise",
     "PCARisk",
     "Pairs",
+    "Pin",
     "Projected",
     "Quantile",
     "RankWeighted",
     "Risk",
+    "Sparse",
+    "Subset",
+    "TargetTE",
     "Term",
     "Tilt",
     "TopN",
     "TrackingError",
+    "TradeLimit",
     "Turnover",
     "Weight",
     "Weighting",

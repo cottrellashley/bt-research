@@ -24,6 +24,14 @@ import pyarrow.parquet as pq
 
 from nautilus_fi.data.panel import Panel
 
+AS_OF_INCLUSIVE = False            # a snapshot stamped exactly at the cutoff is not yet known (strict ``<``), as SentientAlpha enforces
+
+
+def known_at(kt: pd.Timestamp, cut: pd.Timestamp, inclusive: bool | None = None) -> bool:
+    """Whether a snapshot with knowledge time ``kt`` is known at ``cut`` (the boundary is explicit:
+    ``inclusive=None`` uses ``AS_OF_INCLUSIVE``)."""
+    return kt <= cut if (AS_OF_INCLUSIVE if inclusive is None else inclusive) else kt < cut
+
 
 def _kt(ts) -> pd.Timestamp:
     t = pd.Timestamp(ts) if ts is not None else pd.Timestamp.now(tz="UTC")
@@ -86,11 +94,13 @@ class FieldStore:
             out += [(_kt_from_stem(p.stem), p) for p in sorted(ydir.glob("kt=*.parquet"))]
         return out
 
-    def read(self, field: str, start=None, end=None, as_of=None, mode: str = "latest", entities: Iterable[str] | None = None) -> pd.DataFrame:
+    def read(self, field: str, start=None, end=None, as_of=None, mode: str = "latest", entities: Iterable[str] | None = None, inclusive: bool | None = None) -> pd.DataFrame:
+        """Values known at ``as_of``: snapshots with a knowledge time strictly before it (``inclusive``
+        or ``AS_OF_INCLUSIVE``: at or before)."""
         snaps = self.snapshots(field, start, end)
         if as_of is not None:
             cut = _kt(as_of)
-            snaps = [(kt, p) for kt, p in snaps if kt <= cut]
+            snaps = [(kt, p) for kt, p in snaps if known_at(kt, cut, inclusive)]
         if not snaps:
             return pd.DataFrame(columns=["entity", "date", "value", "source", "knowledge_time"])
         want = sorted(set(map(str, entities))) if entities is not None else None

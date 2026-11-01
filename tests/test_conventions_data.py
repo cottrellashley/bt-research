@@ -114,8 +114,10 @@ def test_rebalance_calendars():
     assert parse_calendar("W-WED") == Weekly(2, name="W-WED") and parse_calendar("BME") == MonthEnd()
     five = parse_calendar(5).dates(DAYS, first_decision=True)
     assert all(DAYS.index(b) - DAYS.index(a) == 5 for a, b in itertools.pairwise(five))
-    hol = Explicit((date(2024, 7, 4), date(2024, 12, 25)))                   # holidays move to the previous trading day
-    assert hol.dates(DAYS) == [date(2024, 7, 3), date(2024, 12, 24)]
+    hol = Explicit((date(2024, 7, 4), date(2024, 12, 25)))                   # an instruction on a holiday acts on the next trading day
+    assert hol.dates(DAYS) == [date(2024, 7, 5), date(2024, 12, 26)]
+    ahead = Explicit((date(2024, 7, 4), date(2024, 12, 25)), "on_or_before")  # dates published ahead may move earlier
+    assert ahead.dates(DAYS) == [date(2024, 7, 3), date(2024, 12, 24)]
     idx_cal = IndexCalendar("LUACTRUU", [date(2024, 3, 31), date(2024, 6, 30)])
     assert idx_cal.dates(DAYS) == [date(2024, 3, 28), date(2024, 6, 28)] and idx_cal.name == "INDEX:LUACTRUU"
     with pytest.raises(ValueError):

@@ -16,6 +16,7 @@ convert at the boundary; strategies work in face amounts.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from functools import cached_property
@@ -288,12 +289,26 @@ class BondSpec:
             },
         )
 
-    def round_face(self, face: float) -> float:
-        """Round a face amount to the bond's increment, honouring the minimum piece."""
-        if abs(face) < self.min_piece:
+    def tradable(self, face: float, how: str = "nearest") -> float:
+        """A face amount the bond trades in: zero below the minimum piece, else the minimum piece plus
+        a whole number of increments (``how``: nearest, down or up)."""
+        a = abs(float(face))
+        if a < self.min_piece - 1e-9:
             return 0.0
-        sign = 1.0 if face > 0 else -1.0
-        return sign * (round(abs(face) / self.increment) * self.increment)
+        k = (a - self.min_piece) / self.increment if self.increment else 0.0
+        k = {"nearest": round(k), "down": math.floor(k + 1e-9), "up": math.ceil(k - 1e-9)}[how]
+        return math.copysign(self.min_piece + k * self.increment, face)
+
+    def is_tradable(self, face: float) -> bool:
+        a = abs(float(face))
+        if a < 1e-9:
+            return True
+        return a >= self.min_piece - 1e-9 and (not self.increment or abs(round((a - self.min_piece) / self.increment) * self.increment - (a - self.min_piece)) < 1e-6)
+
+    def round_face(self, face: float) -> float:
+        """Round a face amount to the nearest tradable amount: zero below the minimum piece, else the
+        minimum piece plus whole increments (5,000 x 2,000 trades 5,000, 7,000, 9,000 ...)."""
+        return self.tradable(face, "nearest")
 
     def remaining_years(self, d: date) -> float | None:
         if self.maturity is None:

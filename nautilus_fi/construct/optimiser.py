@@ -30,7 +30,7 @@ import pandas as pd
 from scipy import sparse
 
 from nautilus_fi.construct.cross_section import CrossSection
-from nautilus_fi.construct.grammar import ConstraintSpec, parse_constraints
+from nautilus_fi.construct.grammar import ConstraintSpec, cash_floor, parse_constraints
 from nautilus_fi.domain.conventions import turnover_all
 
 INF = highspy.kHighsInf
@@ -93,7 +93,10 @@ class OptimiserSettings:
     threads: int | None = None
     verbose: bool = False
     zero_tol: float = 1e-9
-    on_infeasible: str = "relax"                 # relax: retry with conflicting limits soft (recorded); keep: hold current weights
+    on_infeasible: str = "relax"                 # relax: the ladder below (recorded, counted, refused promotion); keep: hold current weights; push: keep and retry next day; fail: raise
+    relax_tiers: tuple = (1.5, 2.0)              # ladder: grandfather pre-existing breaches, then widen non-strict limits by these factors, then soften them
+    relax_soft: bool = True                      # last rung: limits soft at relax_penalty (False for live: keep the book instead)
+    diagnose_conflicts: bool = True              # when infeasible, find which limits conflict (one re-solve per limit, at most 12)
     relax_penalty: float = 1_000.0
     initial_build_turnover_exempt: bool = True   # turnover limits do not apply when building from cash
     mip_strategy: str = "auto"                   # full | lp_round | auto (lp_round above mip_full_max_names)
@@ -116,6 +119,7 @@ class OptimisationResult:
     solve_seconds: float
     problem: dict = field(default_factory=dict)
     message: str = ""
+    overlays: pd.Series | None = None              # overlay notionals solved jointly with the book (cs.overlay_data)
 
     def summary(self) -> dict:
         return {"ok": self.ok, "status": self.status, "objective": self.objective, **{f"obj_{k}": v for k, v in self.components.items()}, **{f"turnover_{k}": v for k, v in self.turnover.items()}, "n_names": self.n_names, "n_binding": len(self.binding), "n_relaxed": len(self.relaxations), "solve_seconds": self.solve_seconds, **{f"problem_{k}": v for k, v in self.problem.items()}}
@@ -140,6 +144,7 @@ class _Model:
         self.row_name: list[str] = []
         self.row_soft: dict[int, tuple[int, int, str]] = {}
         self.q: dict[tuple[int, int], float] = defaultdict(float)
+        self.q_blocks: list[tuple[np.ndarray, np.ndarray]] = []      # dense symmetric Hessian blocks on variable indices
         self.offset = 0.0
 
     def add_vars(self, n: int, lo, hi, cost=0.0, integer: bool = False) -> np.ndarray:
@@ -211,16 +216,24 @@ class _Model:
         if integer.any():
             lp.integrality_ = [highspy.HighsVarType.kInteger if x else highspy.HighsVarType.kContinuous for x in integer]
         h.passModel(lp)
-        if self.q:
-            keys = sorted(self.q, key=lambda ij: (ij[1], ij[0]))          # column-wise lower triangle
-            cols = np.array([j for _, j in keys])
-            start = np.searchsorted(cols, np.arange(self.n + 1))
+        if self.q or self.q_blocks:
+            rr, cc, vv = [np.array([i for i, _ in self.q], dtype=np.int64)], [np.array([j for _, j in self.q], dtype=np.int64)], [np.array(list(self.q.values()), dtype=float)]
+            for idx, mat in self.q_blocks:                              # lower triangle of each dense block
+                li, lj = np.tril_indices(len(idx))
+                vals = mat[li, lj]
+                keep = vals != 0
+                rr.append(idx[li[keep]])
+                cc.append(idx[lj[keep]])
+                vv.append(vals[keep])
+            H = sparse.coo_matrix((np.concatenate(vv), (np.concatenate(rr), np.concatenate(cc))), shape=(self.n, self.n)).tocsc()
+            H.sum_duplicates()
+            H = sparse.tril(H).tocsc()
             hess = highspy.HighsHessian()
             hess.dim_ = self.n
             hess.format_ = highspy.HessianFormat.kTriangular
-            hess.start_ = start.astype(np.int32)
-            hess.index_ = np.array([i for i, _ in keys], dtype=np.int32)
-            hess.value_ = np.array([self.q[k] for k in keys], dtype=float)
+            hess.start_ = H.indptr.astype(np.int32)
+            hess.index_ = H.indices.astype(np.int32)
+            hess.value_ = H.data.astype(float)
             h.passHessian(hess)
         h.run()
         status = h.modelStatusToString(h.getModelStatus())
@@ -242,23 +255,92 @@ def optimise(cs: CrossSection, objective: Objective | None = None, constraints=N
     if settings.initial_build_turnover_exempt and float(cs.current.abs().sum()) < 1e-9 and any(c.kind == "turnover" for c in cons):
         cons = [c for c in cons if c.kind != "turnover"]
         notes.append({"constraint": "turnover", "group": None, "reason": "initial build from cash: turnover limit not applied"})
-    integer_kinds = [c for c in cons if c.kind in ("cardinality", "min_holding")]
+    integer_kinds = [c for c in cons if c.kind in ("cardinality", "min_holding")]          # min_trade always solves the full MILP
     strategy = settings.mip_strategy if settings.mip_strategy != "auto" else ("lp_round" if len(cs.ids) > settings.mip_full_max_names else "full")
     rows = list(linear_rows or [])
     run = (lambda cc, lr: _optimise_lp_round(cs, objective, cc, long_only, settings, lr)) if integer_kinds and strategy == "lp_round" else (lambda cc, lr: _optimise(cs, objective, cc, long_only, settings, linear_rows=lr))
     res = run(cons, rows)
-    if not res.ok and settings.on_infeasible == "relax" and res.status in ("Infeasible", "Primal infeasible or unbounded"):
-        from dataclasses import replace as _replace
-
-        keep_hard = ("budget", "cash", "weight", "cardinality", "min_holding")
-        soft = [c if (c.kind in keep_hard or not c.hard) else _replace(c, hard=False, penalty=settings.relax_penalty) for c in cons]
-        retry = run(soft, [_replace(r, hard=False, penalty=settings.relax_penalty) for r in rows])
-        if retry.ok:
-            retry.relaxations = [{"constraint": "all limits", "group": None, "reason": f"hard problem {res.status}: limits other than budget / weight / integer made soft at penalty {settings.relax_penalty}"}, *retry.relaxations]
-            retry.message = f"relaxed after {res.status}"
-            res = retry
+    infeasible = (not res.ok) and res.status in ("Infeasible", "Primal infeasible or unbounded")
+    if not res.ok and settings.on_infeasible == "fail":
+        raise OptimisationError(f"{cs.date:%Y-%m-%d}: the construction problem is {res.status} with every limit hard (OptimiserSettings(on_infeasible='fail'))")
+    conflicts = _conflicts(run, cons, rows, settings) if infeasible and settings.diagnose_conflicts else []
+    if infeasible and settings.on_infeasible == "relax":
+        res = _relax_ladder(cs, run, cons, rows, settings, res, conflicts)
+    elif infeasible and settings.on_infeasible == "push":
+        res.message = f"push: {res.status}; retry on the next trading day"
+    if conflicts:
+        res.relaxations = [*res.relaxations, {"constraint": "conflict", "group": None, "conflicting": conflicts, "reason": f"limits whose removal makes the problem feasible: {', '.join(conflicts)}"}]
     res.relaxations = notes + res.relaxations
     return res
+
+
+_KEEP_HARD = ("budget", "cash", "weight", "cardinality", "min_holding", "min_trade")
+
+
+def _widen(c: ConstraintSpec, f: float) -> ConstraintSpec:
+    from dataclasses import replace as _replace
+
+    def w(x, side):
+        if x is None:
+            return None
+        step = (f - 1.0) * max(abs(x), 0.01)
+        return x - step if side == "lo" else x + step
+    return _replace(c, min=w(c.min, "lo"), max=w(c.max, "hi"))
+
+
+def _breached_by_current(cs: CrossSection, c: ConstraintSpec) -> ConstraintSpec:
+    """A limit the current book already breaches, loosened to where the book stands: the new
+    book may stay in breach but not worsen it (grandfathered)."""
+    from dataclasses import replace as _replace
+
+    from nautilus_fi.construct.grammar import check_constraints
+
+    viol = [v for v in check_constraints(cs.current, cs, [c]) if v.get("group") in (None, "ALL") or c.kind in ("group", "active_group", "exposure", "active_exposure")]
+    if not viol:
+        return c
+    lo, hi = c.min, c.max
+    for v in viol:
+        if v["side"] == "max" and hi is not None:
+            hi = max(hi, float(v["value"]))
+        if v["side"] == "min" and lo is not None:
+            lo = min(lo, float(v["value"]))
+    return _replace(c, min=lo, max=hi)
+
+
+def _relax_ladder(cs, run, cons, rows, settings, res, conflicts):
+    """The relaxation ladder after an infeasible solve: (1) grandfather limits the current book
+    already breaches, (2) widen non-strict limits by each ``relax_tiers`` factor, (3) soften them at
+    ``relax_penalty`` (``relax_soft``). Strict limits and budget / weight / integer rules never move.
+    The rung that worked is recorded with what it changed."""
+    from dataclasses import replace as _replace
+
+    movable = [c for c in cons if c.hard and c.kind not in _KEEP_HARD and not c.strict]
+    labels = sorted({c.label for c in movable} | {r.name for r in rows if r.hard})
+    if not movable and not any(r.hard for r in rows):
+        return res
+    tiers: list[tuple[str, list, list]] = [("grandfathered", [(_breached_by_current(cs, c) if c in movable else c) for c in cons], rows)]
+    for f in settings.relax_tiers:
+        tiers.append((f"widened x{f:g}", [(_widen(c, f) if c in movable else c) for c in cons], rows))
+    if settings.relax_soft:
+        tiers.append(("softened", [(_replace(c, hard=False, penalty=settings.relax_penalty) if c in movable else c) for c in cons], [_replace(r, hard=False, penalty=settings.relax_penalty) for r in rows]))
+    for name, cc, rr in tiers:
+        retry = run(cc, rr)
+        if retry.ok:
+            retry.relaxations = [{"constraint": "all limits", "group": None, "tier": name, "softened": labels, "conflicting": conflicts, "reason": f"hard problem {res.status}: {', '.join(labels) or 'limits'} {name}"}, *retry.relaxations]
+            retry.message = f"relaxed after {res.status} ({name}): {', '.join(labels)}"
+            return retry
+    return res
+
+
+def _conflicts(run, cons, rows, settings) -> list[str]:
+    """Limits whose removal alone makes the problem feasible (an irreducible-set sketch)."""
+    movable = [c for c in cons if c.hard and c.kind not in _KEEP_HARD][:12]
+    out = []
+    for c in movable:
+        trial = run([x for x in cons if x is not c], rows)
+        if trial.ok:
+            out.append(c.label)
+    return out
 
 
 def _optimise_lp_round(cs: CrossSection, objective, cons: list[ConstraintSpec], long_only: bool, settings: OptimiserSettings, linear_rows: list[LinearRow] | None = None) -> OptimisationResult:
@@ -324,6 +406,8 @@ def _optimise(cs: CrossSection, objective: Objective | None, cons: list[Constrai
     unit_cost = (cs.cost_bp.fillna(cs.cost_bp.median() if cs.cost_bp.notna().any() else 0.0).to_numpy(dtype=float) / 1e4 if cs.cost_bp is not None else np.zeros(n)) * objective.cost
     elig = cs.eligible.to_numpy(dtype=bool)
     data = cs.data
+    exits = str(getattr(cs, "exits", "SELL")).upper()
+    leaver = ~elig & (np.abs(w0) > settings.zero_tol)                 # held, no longer in the universe
 
     # ---------------------------------------------------------------- weight bounds -> trade bounds
     lb = np.zeros(n) if long_only else np.full(n, -np.inf)
@@ -340,11 +424,21 @@ def _optimise(cs: CrossSection, objective: Objective | None, cons: list[Constrai
             if c.max is not None:
                 ub = np.minimum(ub, wb + c.max)
     ub = np.where(elig, ub, np.minimum(ub, np.maximum(w0, 0.0)))               # ineligible names can only shrink
+    if getattr(cs, "lb_extra", None) is not None:                              # per-name bounds, pins, no-sell, trade limits
+        lb = np.maximum(lb, np.asarray(cs.lb_extra, dtype=float))
+    if getattr(cs, "ub_extra", None) is not None:
+        ub = np.minimum(ub, np.asarray(cs.ub_extra, dtype=float))
     if ub_override is not None:
         ub = np.minimum(ub, ub_override)
     if lb_override is not None:
         lb = np.maximum(lb, lb_override)
     lb = np.where(elig, lb, np.minimum(lb, 0.0) if long_only else np.minimum(lb, np.minimum(w0, 0.0)))
+    if exits == "SELL":                                                 # leavers are sold now, outside any turnover budget
+        lb = np.where(leaver, 0.0, lb)
+        ub = np.where(leaver, 0.0, ub)
+    elif not long_only:                                                 # EXCLUDE / HOLD_NOT_BUY: a short leaver may only be covered
+        lb = np.where(leaver & (w0 < 0), np.maximum(lb, w0), lb)
+        ub = np.where(leaver & (w0 < 0), np.minimum(ub, 0.0), ub)
     clash = lb > ub
     relaxations: list[dict] = [{"constraint": "weight bounds", "group": ids[i], "from": float(lb[i]), "to": float(ub[i]), "reason": "lower bound above upper bound (ineligible or conflicting)"} for i in np.nonzero(clash)[0][:50]]
     lb = np.where(clash, ub, lb)
@@ -357,22 +451,40 @@ def _optimise(cs: CrossSection, objective: Objective | None, cons: list[Constrai
 
     M = _Model()
     eps = 1e-9                                                          # breaks buy/sell degeneracy when costs are zero
-    b = M.add_vars(n, b_lo, b_hi, -alpha + unit_cost + eps)
-    s = M.add_vars(n, s_lo, s_hi, alpha + unit_cost + eps)
+    reward = np.zeros(n)
+    if exits == "EXCLUDE" and leaver.any():                             # excluded names are reduced first within the budget
+        reward = np.where(leaver, 10.0 * (1.0 + float(np.abs(alpha).max(initial=0.0)) + float(np.abs(unit_cost).max(initial=0.0))), 0.0)
+    b = M.add_vars(n, b_lo, b_hi, -alpha + unit_cost + eps + np.where(leaver & (w0 < 0), -reward, 0.0))
+    s = M.add_vars(n, s_lo, s_hi, alpha + unit_cost + eps + np.where(leaver & (w0 > 0), -reward, 0.0))
     M.offset -= float(alpha @ w0)
     both = np.concatenate([b, s])
+    ovd = getattr(cs, "overlay_data", None)                             # overlays solved with the book: notional h = h0 + hp - hn
+    hv = None
+    if ovd is not None and len(ovd):
+        K = len(ovd)
+        h0 = np.nan_to_num(np.asarray(getattr(cs, "overlay_current", None) if getattr(cs, "overlay_current", None) is not None else np.zeros(K), dtype=float))
+        hc = float(getattr(cs, "overlay_cost_bp", 0.0) or 0.0) / 1e4 + eps
+        hmax = getattr(cs, "overlay_max", None)
+        hp = M.add_vars(K, 0.0, np.full(K, INF) if hmax is None else np.maximum(float(hmax) - h0, 0.0), hc)
+        hn = M.add_vars(K, 0.0, np.full(K, INF) if hmax is None else np.maximum(float(hmax) + h0, 0.0), hc)
+        hv = (hp, hn, h0, ovd)
 
     def trade_coefs(x: np.ndarray, mask: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         idx = np.arange(n) if mask is None else np.nonzero(mask)[0]
         return np.concatenate([b[idx], s[idx]]), np.concatenate([x[idx], -x[idx]])
 
-    def add_band(name: str, x: np.ndarray, const: float, lo: float | None, hi: float | None, c: ConstraintSpec, mask: np.ndarray | None = None) -> None:
+    def add_band(name: str, x: np.ndarray, const: float, lo: float | None, hi: float | None, c: ConstraintSpec, mask: np.ndarray | None = None, overlay_field: str | None = None) -> None:
         cols, vals = trade_coefs(x, mask)
+        if hv is not None and overlay_field is not None and overlay_field in hv[3].columns:     # the overlays' exposure counts too
+            xo = np.nan_to_num(hv[3][overlay_field].to_numpy(dtype=float))
+            cols, vals = np.concatenate([cols, hv[0], hv[1]]), np.concatenate([vals, xo, -xo])
+            const += float(hv[2] @ xo)
         row = M.add_row(cols, vals, -INF if lo is None else lo - const, INF if hi is None else hi - const, name)
         if not c.hard:
             M.soften(row, c.penalty, name)
 
     has_budget = any(c.kind in ("budget", "cash") for c in cons)
+    levered = any(c.kind in ("budget", "leverage") for c in cons)
     if not has_budget and long_only:
         cons = [*cons, ConstraintSpec("budget", 1.0, 1.0, name="budget (default: fully invested)")]
     ones = np.ones(n)
@@ -381,8 +493,9 @@ def _optimise(cs: CrossSection, objective: Objective | None, cons: list[Constrai
         k = c.kind
         if k == "budget":
             add_band(c.label, ones, float(w0.sum()), c.min, c.max, c)
-        elif k == "cash":
-            add_band(c.label, ones, float(w0.sum()), None if c.max is None else 1.0 - c.max, None if c.min is None else 1.0 - c.min, c)
+        elif k == "cash":                                               # cash = 1 - sum(w) in [min (default 0 unless levered), max]
+            floor = cash_floor(c, levered)
+            add_band(c.label, ones, float(w0.sum()), None if c.max is None else 1.0 - c.max, None if floor is None else 1.0 - floor, c)
         elif k in ("weight", "active_weight") and not c.hard:
             for i in range(n):
                 base = wb[i] if k == "active_weight" else 0.0
@@ -397,6 +510,8 @@ def _optimise(cs: CrossSection, objective: Objective | None, cons: list[Constrai
                 mask = g == grp
                 if not mask.any():
                     continue
+                if c.min_benchmark_weight is not None and float(wb[mask].sum()) < c.min_benchmark_weight:
+                    continue                                            # a group the index barely holds: not constrained
                 const = float(w0[mask].sum() - (wb[mask].sum() if k == "active_group" else 0.0))
                 add_band(f"{c.label}:{grp}", ones, const, c.min, c.max, c, mask)
         elif k in ("exposure", "active_exposure"):
@@ -410,10 +525,11 @@ def _optimise(cs: CrossSection, objective: Objective | None, cons: list[Constrai
                 if k == "active_exposure" and c.relative:
                     lo = None if lo is None else lo * abs(bexp)
                     hi = None if hi is None else hi * abs(bexp)
-                add_band(f"{c.label}{'' if grp == 'ALL' else ':' + grp}", x, const, lo, hi, c, mask)
+                add_band(f"{c.label}{'' if grp == 'ALL' else ':' + grp}", x, const, lo, hi, c, mask, c.attribute if grp == "ALL" else None)
         elif k == "turnover":
             fb, fs = {"HALF_SUM": (0.5, 0.5), "TWO_WAY": (1.0, 1.0), "ONE_WAY_BUYS": (1.0, 0.0)}[c.definition]
-            row = M.add_row(both, np.concatenate([np.full(n, fb), np.full(n, fs)]), -INF, c.max, c.label)
+            forced = (fs * float(w0[leaver & (w0 > 0)].sum()) + fb * float(-w0[leaver & (w0 < 0)].sum())) if exits == "SELL" else 0.0
+            row = M.add_row(both, np.concatenate([np.full(n, fb), np.full(n, fs)]), -INF, INF if c.max is None else c.max + forced, c.label)
             if not c.hard:
                 M.soften(row, c.penalty, c.label)
         elif k == "leverage":
@@ -430,6 +546,19 @@ def _optimise(cs: CrossSection, objective: Objective | None, cons: list[Constrai
                     M.soften(row, c.penalty, c.label)
         elif k in ("cardinality", "min_holding"):
             integer_needed = True
+        elif k == "min_trade" and c.min is not None:                       # semi-continuous trades: zero or at least c.min
+            m = float(c.min)
+            zb = M.add_vars(n, 0.0, 1.0, 0.0, integer=True)
+            zs = M.add_vars(n, 0.0, 1.0, 0.0, integer=True)
+            capb = np.where(b_hi < INF, b_hi, 1.0)
+            caps = np.where(s_hi < INF, s_hi, 1.0)
+            mb = np.minimum(m, capb)
+            ms = np.minimum(m, np.where(w0 > 0, np.minimum(w0, caps), caps))     # closing a position smaller than the minimum is allowed
+            r = np.arange(n)
+            M.add_rows(np.concatenate([r, r]), np.concatenate([b, zb]), np.concatenate([np.ones(n), -capb]), np.full(n, -np.inf), np.zeros(n), [f"mtb+:{i}" for i in ids])
+            M.add_rows(np.concatenate([r, r]), np.concatenate([b, zb]), np.concatenate([np.ones(n), -mb]), np.zeros(n), np.full(n, np.inf), [f"mtb-:{i}" for i in ids])
+            M.add_rows(np.concatenate([r, r]), np.concatenate([s, zs]), np.concatenate([np.ones(n), -caps]), np.full(n, -np.inf), np.zeros(n), [f"mts+:{i}" for i in ids])
+            M.add_rows(np.concatenate([r, r]), np.concatenate([s, zs]), np.concatenate([np.ones(n), -ms]), np.zeros(n), np.full(n, np.inf), [f"mts-:{i}" for i in ids])
         elif k == "cvar":
             _add_cvar(M, cs, b, s, w0, wb, n, c.beta, c.active, constraint=c)
 
@@ -501,9 +630,10 @@ def _optimise(cs: CrossSection, objective: Objective | None, cons: list[Constrai
     status, x, duals, obj, gap, A = M.solve(settings)
     ok = status in ("Optimal",) or (status in ("Time limit reached", "Iteration limit reached") and np.isfinite(obj) and len(x) == M.n and obj < INF)
     solve_s = time.perf_counter() - t0
-    problem = {"n_names": n, "n_vars": M.n, "n_rows": len(M.row_lo), "integer": bool(integer_needed), "quadratic": bool(M.q), "mip_gap": gap}
+    problem = {"n_names": n, "n_vars": M.n, "n_rows": len(M.row_lo), "integer": bool(integer_needed), "quadratic": bool(M.q) or bool(M.q_blocks), "mip_gap": gap}
     if not ok or len(x) != M.n:
         return OptimisationResult(cs.current.copy(), False, status, float("nan"), {}, [], {}, relaxations, {k: 0.0 for k in ("ONE_WAY_BUYS", "HALF_SUM", "TWO_WAY")}, int((np.abs(w0) > settings.zero_tol).sum()), solve_s, problem, f"solver status {status}: weights left unchanged")
+    obj += float(reward @ (x[b] + x[s]))                                # report the objective without the exclusion reward
     w = w0 + x[b] - x[s]
     w[np.abs(w) < settings.zero_tol] = 0.0
     weights = pd.Series(w, index=ids)
@@ -525,7 +655,13 @@ def _optimise(cs: CrossSection, objective: Objective | None, cons: list[Constrai
         comps["cvar"] = float(x[cvar_cols[0]] + x[cvar_cols[1]].sum() * cvar_cols[2])
     if risk_info is not None:
         comps["active_variance"] = _variance(objective.risk, ids, w - (wb if objective.risk.active else 0.0))
-    return OptimisationResult(weights, True, status, obj, comps, binding, dual_map, relaxations, turnover_all(cs.current, weights), int((np.abs(w) > settings.zero_tol).sum()), solve_s, problem)
+    ov_out = None
+    if hv is not None:
+        h = hv[2] + x[hv[0]] - x[hv[1]]
+        h[np.abs(h) < settings.zero_tol] = 0.0
+        ov_out = pd.Series(h, index=hv[3].index)
+        comps["overlay_cost"] = float(hc * (x[hv[0]] + x[hv[1]]).sum())
+    return OptimisationResult(weights, True, status, obj, comps, binding, dual_map, relaxations, turnover_all(cs.current, weights), int((np.abs(w) > settings.zero_tol).sum()), solve_s, problem, overlays=ov_out)
 
 
 def _add_cvar(M: _Model, cs: CrossSection, b, s, w0, wb, n, beta: float, active: bool, constraint: ConstraintSpec | None = None, weight: float = 1.0):
@@ -548,6 +684,9 @@ def _add_cvar(M: _Model, cs: CrossSection, b, s, w0, wb, n, beta: float, active:
     return (zeta, psi, coef)
 
 
+DENSE_RISK_MAX_NAMES = 1500        # the factor form's free variables trip HiGHS's QP solver on some models (PCA): dense up to here
+
+
 def _add_risk(M: _Model, rm: RiskModel, ids, b, s, w0, wb, n):
     L = rm.loadings.reindex(ids).fillna(0.0).to_numpy(dtype=float)
     F = rm.factor_cov.to_numpy(dtype=float)
@@ -555,6 +694,14 @@ def _add_risk(M: _Model, rm: RiskModel, ids, b, s, w0, wb, n):
     k = F.shape[0]
     d = w0 - (wb if rm.active else 0.0)
     lam = rm.aversion
+    if n <= DENSE_RISK_MAX_NAMES:                                       # lam a'Sa on a = d + b - s, as a dense block on (b, s)
+        S = 2.0 * lam * (L @ F @ L.T + np.diag(spec))
+        M.q_blocks.append((np.concatenate([b, s]), np.block([[S, -S], [-S, S]])))
+        g = S @ d
+        M.cost[0] = M.cost[0] + g
+        M.cost[1] = M.cost[1] - g
+        M.offset += 0.5 * float(d @ S @ d)
+        return True
     y = M.add_vars(k, -INF, INF)
     # y - L'(b - s) = L'd
     for j in range(k):

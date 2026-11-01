@@ -31,7 +31,7 @@ def env():
 
 
 def make_corp():
-    return EqualWeightCorporates(EqualWeightCorporatesConfig(strategy_id=StrategyId("EQW-001"), rebalance="M", max_names=6))
+    return EqualWeightCorporates(EqualWeightCorporatesConfig(strategy_id=StrategyId("EQW-001"), rebalance="BMS", max_names=6))
 
 
 def test_environment_records_mark_tiers(env):
@@ -63,7 +63,7 @@ def test_execution_timing_and_ladder(env):
 
 def test_all_asset_types_cashflows(env):
     e, mkt = env
-    strat = EqualWeightEverything(EqualWeightEverythingConfig(strategy_id=StrategyId("ALL-001"), rebalance="M"))
+    strat = EqualWeightEverything(EqualWeightEverythingConfig(strategy_id=StrategyId("ALL-001"), rebalance="BMS"))
     res = FixedIncomeBacktest(e, strat, NET_FULL, settings=BacktestSettings(starting_cash=200e6)).run()
     kinds = set(res.cashflows["type"])
     assert {"COUPON", "ACCRUED_PAID"} <= kinds

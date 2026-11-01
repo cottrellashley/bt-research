@@ -76,9 +76,9 @@ def test_multi_sector_sleeve_loans_settle_t_plus_7(market_env):
     assert {AssetType.LOAN, AssetType.CORPORATE} <= types and (types & {AssetType.CLO, AssetType.ABS, AssetType.CMBS, AssetType.MBS})
 
 
-def test_hedged_sleeve_funds_eur_bonds_at_spot(market_env):
+def test_unhedged_sleeve_funds_eur_bonds_at_spot(market_env):
     _, env = market_env
-    res = _run(env, "DEVELOPED_WORLD_HEDGED")
+    res = _run(env, "DEVELOPED_WORLD_UNHEDGED")
     _identity(res)
     eur = res.fills[res.fills["symbol"].map(lambda s: env.bonds[s].currency == "EUR")]
     assert not eur.empty

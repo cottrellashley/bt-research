@@ -39,6 +39,13 @@ decide what the engines do. It is built for a research agent working next to the
 that answers a PM's "if I change my strategy this way, how would it perform, and why?". See
 [docs/kernel.md](docs/kernel.md).
 
+Each area's primitives (timing, returns, the optimiser, costs, overlays, metrics, validation) are
+listed in [docs/primitives.md](docs/primitives.md). Live proposals and the interface to an
+operational portfolio store are in [docs/operations.md](docs/operations.md). The legacy-framework
+adapters and their parity harness are in [docs/adapters.md](docs/adapters.md). Where each item of
+the October 2026 gap analysis stands is in
+[docs/gap-analysis-status.md](docs/gap-analysis-status.md).
+
 ```python
 import nautilus_fi as nfi
 
@@ -79,7 +86,7 @@ overlays, implementation, and governance. See [docs/generalisation.md](docs/gene
 | Stage | What it is | Package |
 | --- | --- | --- |
 | Evaluate | rank IC by horizon, quantile and Q5-Q1 spreads, Newey-West t-statistics, block bootstrap, neutralised IC | `nautilus_fi.paper.evaluate` |
-| Paper | vectorised simulation on return panels: lags in trading days, per-change costs, leverage, shorts, overlays, drifting weights; no terms needed; 9k bonds x 10y in seconds to minutes | `nautilus_fi.paper` |
+| Paper | vectorised simulation on return panels: lags in trading days, costs in bp of traded value, leverage, shorts, overlays, drifting weights; no terms needed; 9k bonds x 10y in seconds to minutes | `nautilus_fi.paper` |
 | Implement | the event engine, generalised: vendor analytics, generic fields, benchmark constituents, terms-free bonds, margin venue (TRS, CDX, futures, FX forwards, synthetic shorts), repo-financed leverage, streamed replay | `nautilus_fi.backtest`, `nautilus_fi.overlays` |
 | Propose | the same construction spec as orders: bid/ask dirty pricing, settlement dates, pre-trade checks, CRD / QOE / PORT files, reconciliation | `nautilus_fi.propose` |
 
@@ -157,7 +164,7 @@ instrument-day); a Nautilus run takes a couple of seconds.
 
 `examples/fund_sleeves.py` holds thirteen mandate archetypes (AAA CLO, mezzanine CLO, agency MBS,
 securitized income, ultrashort, IG corporate, EM hard currency, multi-sector income, core-plus,
-short-duration flexible, high yield, developed-world hedged, money market) as bucketed
+short-duration flexible, high yield, developed-world unhedged, money market) as bucketed
 `FixedIncomeStrategy` subclasses with constraints and forced-action policies. On the 2023 synthetic
 market (51 instruments including a CLO, an ABS and a CMBS deal run through the internal waterfall
 engine, loans, a hybrid perpetual, munis, EM sovereigns, EUR credit funded at spot, a CPI-indexed
@@ -176,7 +183,7 @@ linker, commercial paper) all thirteen complete, stay solvent and keep the ledge
 | CORE_PLUS | +13.2% | 0.96 | 1.7 | 18.8 | 7.0% | yes |
 | SHORT_DURATION_FLEX | +4.5% | 0.75 | 2.0 | 18.2 | 6.5% | yes |
 | HIGH_YIELD | +2.3% | 0.21 | 2.5 | 66.1 | 27.4% | yes |
-| DEVELOPED_WORLD_HEDGED | +5.8% | 0.73 | 1.2 | 0.9 | 0.2% | yes |
+| DEVELOPED_WORLD_UNHEDGED | +5.8% | 0.73 | 1.2 | 0.9 | 0.2% | yes |
 | MONEY_MARKET | +1.3% | 1.00 | 1.5 | 0.0 | 0.6% | yes |
 
 The numbers come from a synthetic market and say nothing about real markets. What they show is the
@@ -287,23 +294,29 @@ nautilus_fi/
   paper/         panel engine, signal evaluation, Paper / Implement reconciliation
   governance/    trial ledger, walk-forward, official records
   overlays/      margin-venue contracts (TRS, CDX, bond TRS, futures, FX forwards) and fill model
-  propose/       trade proposals, OMS / PORT writers, reconciliation
+  propose/       trade proposals, live checks with severities, futures lines, PM feedback, OMS / PORT
+                 writers, fills and book reconciliation, the target-book interface
+  adapters/      one module per legacy framework (conventions profile, components, parity cases) and
+                 the parity harness
   data/          ... plus panel, field_store, loaders/ (sql, snowflake, fiatlas, files)
   support.py     the declared support matrix
 examples/        agent_workflow (the PM what-if loop), fund_sleeves, strategies, run_fund_sleeves, run_carry_strategy,
                  run_cost_scenarios, family1..6
-tests/           172 tests: the original 92 plus conventions / data, construction, paper / governance,
-                 the generalised event engine, proposals / loaders, and the research kernel
-docs/            kernel, architecture, generalisation, data contracts, bias checklist, support matrix, blueprint status
+tests/           268 tests: the original 92 plus conventions / data, construction, paper / governance,
+                 the generalised event engine, proposals / loaders, the research kernel, the gap-analysis
+                 fixes, platform primitives and legacy adapters
+docs/            kernel, primitives, operations, adapters, gap-analysis status, architecture, generalisation,
+                 data contracts, bias checklist, support matrix, blueprint status
 ```
 
 ## Known limits
 
 See [docs/blueprint_status.md](docs/blueprint_status.md) and the last section of
 [docs/generalisation.md](docs/generalisation.md) for the full list. The short version: TBA delivery,
-FX hedge programs and securities lending remain valuation and posting modules; derivatives, shorts and
+FX hedge programs (in Implement) and securities lending remain valuation and posting modules, Paper running hedge programmes as hedged return series; derivatives, shorts and
 repo-financed leverage trade through the margin venue and the funding policy with the approximations
-the support matrix states; the external deal engine is an adapter contract; the stochastic
+the support matrix states; the legacy-framework adapters are built but not confirmed against
+their golden outputs; the external deal engine is an adapter contract; the stochastic
 simulation run mode, auction events, covenants, extraordinary municipal redemptions and convertibles
 are not built; OMS / PORT layouts and the FIAtlas catalogue are templates to confirm against your
 systems; and the execution process still needs calibrating on your own order history.

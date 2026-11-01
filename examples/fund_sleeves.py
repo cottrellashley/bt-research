@@ -102,7 +102,7 @@ class SleeveSpec:
     config: dict = field(default_factory=dict)
     asset_families: tuple[str, ...] = ()
 
-    def make(self, strategy_id: str, rebalance: str = "M"):
+    def make(self, strategy_id: str, rebalance: str = "BMS"):
         from nautilus_trader.model import StrategyId
 
         cfg = SleeveConfig(strategy_id=StrategyId(strategy_id), rebalance=rebalance, buckets=self.buckets, **self.config)
@@ -143,7 +143,7 @@ SLEEVES: dict[str, SleeveSpec] = {
         Bucket("bills", UniverseFilter(asset_types={AssetType.BILL}), 0.20),
     ], {}, {"invested_fraction": 0.97}, ("CORPORATE", "ABS", "CLO", "LOAN", "BILL")),
     "HIGH_YIELD": SleeveSpec("HIGH_YIELD", "High-yield bond", [Bucket("hy", UniverseFilter(asset_types={AssetType.CORPORATE, AssetType.LOAN}, currencies={"USD"}, min_rating_score=S("BB+"), max_rating_score=S("CCC+")), 1.0)], {"constraints": [ISSUER_CAP], "forced_actions": ForcedActionPolicy(max_rating_score=S("CCC+"), downgrade_action="DELAYED", downgrade_grace_days=20)}, {"invested_fraction": 0.95}, ("CORPORATE", "LOAN", "DISTRESSED")),
-    "DEVELOPED_WORLD_HEDGED": SleeveSpec("DEVELOPED_WORLD_HEDGED", "Developed world bond, USD hedged", [
+    "DEVELOPED_WORLD_UNHEDGED": SleeveSpec("DEVELOPED_WORLD_UNHEDGED", "Developed world bond, unhedged: EUR legs bought with USD converted at spot, no forward hedge", [
         Bucket("ust", UniverseFilter(asset_types={AssetType.SOVEREIGN}, currencies={"USD"}, custom=_not_tag("em_hard_currency")), 0.50),
         Bucket("eur_credit", UniverseFilter(asset_types={AssetType.CORPORATE}, currencies={"EUR"}, max_rating_score=S("BBB-")), 0.50),
     ], {}, {"invested_fraction": 0.95}, ("SOVEREIGN", "CORPORATE", "FX")),

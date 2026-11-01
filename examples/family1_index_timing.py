@@ -1,7 +1,7 @@
 """Family 1 - timing an index excess-return series.
 
 The index is a tradable return stream (no terms): exposure from 0.5x to 2x driven by trailing
-excess-return momentum, an explicit lag in trading days, per-change costs, and walk-forward selection
+excess-return momentum, an explicit lag in trading days, costs in bp of traded value, and walk-forward selection
 of the look-back with purging and embargo. The same decider runs under the canonical conventions
 (trade T+1, earn T+2) and the MRI v1 profile (trade on the close the signal sees) to show what the
 convention is worth. Then the chosen spec runs in the event engine as a financed total-return swap
@@ -104,7 +104,7 @@ def implement_as_trs(quick: bool) -> None:
             self.rebalance_to_weights({s: 0.85 / len(govts) for s in govts})
             self.rebalance_overlays({"IG-XR-TRS": exposure})
 
-    res = FixedIncomeBacktest(env, Timed(FixedIncomeStrategyConfig(rebalance="W")), NET_SPREAD, settings=BacktestSettings(starting_cash=100e6, margin=MarginSettings(collateral=5e6, book=book))).run()
+    res = FixedIncomeBacktest(env, Timed(FixedIncomeStrategyConfig(rebalance="WS")), NET_SPREAD, settings=BacktestSettings(starting_cash=100e6, margin=MarginSettings(collateral=5e6, book=book))).run()
     nav = res.nav
     print(f"event engine: {res.status}/{res.outcome}, NAV {nav['nav'].iloc[-1]:,.0f}, max overlay notional {nav['overlay_gross_notional'].max():,.0f}, margin equity {nav['margin_equity'].iloc[-1]:,.0f}, invariants {bool(res.invariants()['passed'].all())}")
 

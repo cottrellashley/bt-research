@@ -7,8 +7,8 @@ One loop over trading days, numpy over the cross-section. On each day:
    is redeemed into cash, a missing return on a held asset follows the conventions' policy;
 2. on decision dates (the rebalance calendar) the decider sees the point-in-time ``DecisionView``
    and the construction spec turns its target into weights;
-3. trades decided ``timing.trade_offset_days`` earlier execute at today's close, paying per-change
-   costs (bp of traded value from a cost field or a default), and become the weights that earn the
+3. trades decided ``timing.trade_offset_days`` earlier execute at today's close, paying costs
+   in bp of traded value (from a cost field or a default), and become the weights that earn the
    next period.
 
 The same ``ResearchSpec`` runs in the event engine (``backtest.spec_strategy``); results reconcile
@@ -159,8 +159,9 @@ class PaperResult:
         out["gross_annual_return"] = g.get("annual_return")
         years = out.get("years") or float("nan")
         if not self.trades.empty:
-            for k in ("ONE_WAY_BUYS", "HALF_SUM", "TWO_WAY"):
-                out[f"turnover_annual_{k.lower()}"] = float(self.trades[k].sum() / years) if years else float("nan")
+            ongoing = self.trades[~self.trades["initial_build"].fillna(False).astype(bool)] if "initial_build" in self.trades else self.trades
+            for k in ("ONE_WAY_BUYS", "HALF_SUM", "TWO_WAY"):                    # the build from cash is not turnover
+                out[f"turnover_annual_{k.lower()}"] = float(ongoing[k].sum() / years) if years else float("nan")
             out["turnover_annual"] = out[f"turnover_annual_{self.conventions.turnover.value.lower()}"]
             out["cost_drag_annual"] = float(self.costs.sum() / years) if years else float("nan")
             out["n_rebalances"] = len(self.trades)
@@ -168,11 +169,16 @@ class PaperResult:
         out["avg_cash_weight"] = float(self.daily["cash_weight"].mean())
         out["max_gross_exposure"] = float(self.daily["gross_exposure"].max())
         out["hard_violations"] = int((self.violations["severity"] == "HARD").sum()) if not self.violations.empty else 0
-        try:
-            ex = self.excess()
-            out["excess_annual_return"] = float((1 + ex.iloc[1:]).prod() ** (1 / years) - 1) if years else float("nan")
-        except ValueError:
-            pass
+        d = self.daily
+        vendor = d["excess_vendor"].iloc[1:] if "excess_vendor" in d and d["excess_vendor"].notna().any() else None
+        tsy = d["treasury_leg"].iloc[1:] if "treasury_leg" in d and d["treasury_leg"].notna().any() else None
+        if vendor is not None or tsy is not None:
+            from nautilus_fi.domain.conventions import annualised_excess
+
+            try:
+                out["excess_annual_return"] = annualised_excess(self.gross.iloc[1:], tsy, self.conventions.excess_return, years, vendor, self.conventions.prefer_vendor_excess)
+            except ValueError:
+                pass
         out["missing_returns"] = self.missing
         return out
 
@@ -208,8 +214,7 @@ class PaperEngine:
             last = np.where(fin_r.any(axis=0), T - 1 - fin_r[::-1].argmax(axis=0), -1)
             tt = np.arange(T)[:, None]
             alive = (tt >= first[None, :] - 1) & (tt <= last[None, :])
-        cash = (data.cash.reindex(dates).fillna(0.0).to_numpy() if data.cash is not None else np.zeros(T))
-        dt = np.concatenate([[1 / 252], np.diff(dates.values).astype("timedelta64[D]").astype(float) / 365.0])
+        cash_raw = data.cash.reindex(dates).to_numpy(dtype=np.float64) if data.cash is not None else np.zeros(T)
         xr = panel[data.excess_field].astype(np.float64) if data.excess_field and data.excess_field in panel else None
         tsy = panel[data.treasury_field].astype(np.float64) if data.treasury_field and data.treasury_field in panel else None
         refill = panel[data.refill_field].astype(np.float64) if data.refill_field and data.refill_field in panel else None
@@ -233,7 +238,7 @@ class PaperEngine:
         missing = {"policy": conv.missing_returns.value, "bad_dates": [], "zero_filled": 0, "refilled": 0, "redeemed": 0}
         if conv.missing_returns in (MissingReturnPolicy.DROP_DATE, MissingReturnPolicy.REFILL):
             win = slice(t_lo + 1, t_hi + 1)                  # the first date has no return period
-            bad = detect_bad_dates(pd.DataFrame(R[win], index=dates[win], columns=ids), conv.bad_date_threshold, pd.DataFrame(alive[win], index=dates[win], columns=ids))
+            bad = detect_bad_dates(pd.DataFrame(R[win], index=dates[win], columns=ids), conv.bad_date_threshold, pd.DataFrame(alive[win], index=dates[win], columns=ids), conv.bad_date_zeros_only)
             missing["bad_dates"] = [str(pd.Timestamp(b).date()) for b in bad]
             if bad and conv.missing_returns == MissingReturnPolicy.REFILL:
                 if refill is None:
@@ -246,10 +251,36 @@ class PaperEngine:
                 drop = {dates.get_loc(b) for b in bad}
                 R = R.copy()
                 for i in drop:
-                    R[i] = 0.0
+                    R[i] = np.where(alive[i], 0.0, R[i])
                 missing["dropped"] = len(drop)
+        refilled = None
+        if conv.missing_returns == MissingReturnPolicy.REFILL and refill is not None:     # every gap a refill covers, held or not
+            fill = alive & ~np.isfinite(R) & np.isfinite(refill)
+            fill[: t_lo + 1] = False
+            fill[t_hi + 1:] = False
+            R = np.where(fill, refill, R)
+            refilled = fill
+        if bench_w is not None and (refilled is not None or missing.get("dropped")):     # the benchmark earns what the portfolio earns
+            br = np.zeros(T)
+            br[1:] = (bench_w[:-1] * np.nan_to_num(R[1:])).sum(axis=1)
+            bench_ret = pd.Series(br, index=dates)
+        rows = np.arange(t_lo, t_hi + 1)                                     # the run's periods: DROP_DATE removes bad dates
+        if missing.get("dropped"):
+            rows = np.setdiff1d(rows, np.asarray(sorted(dates.get_loc(b) for b in pd.to_datetime(missing["bad_dates"])), dtype=np.int64))
+        from nautilus_fi.kernel.engine import _period_series
 
-        trading_days = list(dates.date[t_lo:t_hi + 1])
+        cash, cash_gap = _period_series(pd.DataFrame({"cash": cash_raw}, index=dates), "cash", dates, rows)
+        dt = np.zeros(T)
+        dt[rows[1:]] = (dates.values[rows[1:]] - dates.values[rows[:-1]]).astype("timedelta64[D]").astype(float) / 365.0
+        if bench_w is not None:
+            tb = rows[1:]
+            gb = (bench_w[tb - 1] > 0) & alive[tb] & ~np.isfinite(R[tb])
+            if gb.any():
+                if conv.missing_returns in (MissingReturnPolicy.FAIL, MissingReturnPolicy.REFILL):
+                    raise MissingReturnsError(f"benchmark: {int(gb.sum())} missing member returns (first on {dates[tb[np.argmax(gb.any(axis=1))]].date()}) under {conv.missing_returns.value}; choose ZERO or DROP_DATE explicitly")
+                missing["benchmark_zero_filled"] = int(gb.sum())
+
+        trading_days = list(dates.date[rows])
         decisions = set(dates.get_indexer(pd.to_datetime(cal.dates(trading_days, st.first_decision))))
         lag = conv.timing.trade_offset_days
         pending: dict[int, tuple[np.ndarray, np.ndarray, int]] = {}
@@ -275,9 +306,11 @@ class PaperEngine:
         borrow = st.borrow_fee_bp / 1e4
         cost_m = panel[data.cost_field] if data.cost_field and data.cost_field in panel else None
         fields_for_cs = [f for f in (st.fields or panel.fields) if f in panel]
-        for t in range(t_lo, t_hi + 1):
+        n_rows = len(rows)
+        for j, t in enumerate(rows):
+            t = int(t)
             # 1) earn the period
-            if t > t_lo:
+            if j > 0:
                 rt = R[t]
                 held = w != 0
                 dead = held & ~alive[t]
@@ -286,18 +319,21 @@ class PaperEngine:
                     w = np.where(dead, 0.0, w)
                     held = w != 0
                 gaps = held & ~np.isfinite(rt)
+                if refilled is not None:
+                    missing["refilled"] += int((refilled[t] & held).sum())
                 if gaps.any():
-                    if conv.missing_returns == MissingReturnPolicy.ZERO:
+                    if conv.missing_returns in (MissingReturnPolicy.ZERO, MissingReturnPolicy.DROP_DATE):
                         missing["zero_filled"] += int(gaps.sum())
-                    elif conv.missing_returns == MissingReturnPolicy.REFILL and refill is not None and np.isfinite(refill[t][gaps]).all():
-                        rt = np.where(gaps, refill[t], rt)
-                        missing["refilled"] += int(gaps.sum())
                     else:
                         bad_ids = list(ids[gaps][:5])
                         raise MissingReturnsError(f"{int(gaps.sum())} missing returns on held assets on {dates[t].date()} ({bad_ids}) under {conv.missing_returns.value}; choose ZERO, DROP_DATE or REFILL explicitly")
                 rc = np.where(held, np.nan_to_num(rt), 0.0)
                 asset = float(w @ rc)
                 cw = 1.0 - float(w.sum())
+                if cash_gap[t] and abs(cw) > 1e-9 and data.cash is not None:
+                    if conv.missing_returns == MissingReturnPolicy.FAIL:
+                        raise MissingReturnsError(f"cash has no value for the period ending {dates[t].date()} while the portfolio holds {cw:.2%} in cash, under FAIL")
+                    missing["cash_zero_filled"] = missing.get("cash_zero_filled", 0) + 1
                 cash_part = cw * cash[t] if cw >= 0 else cw * (cash[t] + fin_spread * dt[t])
                 short = float(-w[w < 0].sum()) * borrow * dt[t]
                 ovr = ovR[t] - np.where(fin, cash[t], 0.0) if K else np.zeros(0)
@@ -315,13 +351,13 @@ class PaperEngine:
             if t in decisions:
                 tgt = self._decide(panel, t, w, o, alive, bench_w, attrs, nav, fields_for_cs, cost_m, cal, last_decision, st, data, ov, cons_rows, viol_rows)
                 if tgt is not None:
-                    if t + lag <= t_hi:
-                        pending[t + lag] = (tgt[0], tgt[1], t)
+                    if j + lag < n_rows:
+                        pending[j + lag] = (tgt[0], tgt[1], t)
                     last_decision = t
             # 3) execute trades due at today's close
             c = 0.0
-            if t in pending:
-                tw, to, dec_t = pending.pop(t)
+            if j in pending:
+                tw, to, dec_t = pending.pop(j)
                 tw = np.where(alive[t] | (tw == 0), tw, 0.0)                 # cannot buy what no longer exists
                 dw = tw - w
                 cbp = np.nan_to_num(cost_m[t].astype(np.float64), nan=st.default_cost_bp) if cost_m is not None else np.full(N, st.default_cost_bp)
@@ -329,7 +365,7 @@ class PaperEngine:
                 if K:
                     c += float(np.abs(to - o).sum()) * data.overlay_cost_bp / 1e4 * st.cost_multiplier
                 tov = turnover_all(pd.Series(w, index=ids)[w != 0], pd.Series(tw, index=ids)[tw != 0])
-                trades_rows.append({"decision_date": dates[dec_t], "trade_date": dates[t], **tov, "cost": c, "n_buys": int((dw > 1e-12).sum()), "n_sells": int((dw < -1e-12).sum())})
+                trades_rows.append({"decision_date": dates[dec_t], "trade_date": dates[t], **tov, "cost": c, "n_buys": int((dw > 1e-12).sum()), "n_sells": int((dw < -1e-12).sum()), "initial_build": bool(not np.any(w))})
                 w, o = tw, (to if K else o)
                 nz = np.nonzero(w)[0]
                 weight_rows.append(pd.DataFrame({"date": dates[t], "instrument_id": ids[nz], "weight": w[nz]}))
@@ -349,7 +385,7 @@ class PaperEngine:
                 exposures[f][t] = float(w @ x)
                 if act_exposures:
                     act_exposures[f][t] = exposures[f][t] - float(bench_w[t] @ x)
-        win = slice(t_lo, t_hi + 1)
+        win = rows
         idx = dates[win]
         gross, net, costs, navs, cash_w, gexp, nexp, names = (a[win] for a in (gross, net, costs, navs, cash_w, gexp, nexp, names))
         ex_vendor = ex_vendor[win] if ex_vendor is not None else None

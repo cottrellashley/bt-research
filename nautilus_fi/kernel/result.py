@@ -28,6 +28,17 @@ import pandas as pd
 
 from nautilus_fi.kernel.mechanics import STAT_KEYS
 
+FILL_KEYS = ("zero_filled", "refilled", "unexplained_exits", "benchmark_zero_filled", "benchmark_refilled", "cash_zero_filled", "risk_free_zero_filled", "cost_filled", "dropped", "snapped_observations")
+
+
+def fill_count(missing: dict) -> int:
+    """Every value the run supplied in place of missing or misaligned data (zero fills, refills,
+    unexplained exits, benchmark, cash and cost fills, dropped dates, off-calendar observations):
+    what the promotion gate refuses to treat as clean."""
+    n = sum(int(missing.get(k, 0) or 0) for k in FILL_KEYS)
+    return n + (1 if missing.get("cash_series_absent") else 0)
+
+
 HEADLINE = ("annual_return", "annual_vol", "sharpe", "max_drawdown", "tracking_error", "information_ratio", "active_annual_return", "turnover", "cost_drag", "avg_names", "excess_annual_return")
 
 
@@ -71,27 +82,57 @@ class Result:
     def active(self) -> pd.Series | None:
         return None if self.benchmark_returns is None else (self.returns - self.benchmark_returns).rename("active")
 
+    def excess_legs(self) -> dict | None:
+        """The per-period legs excess returns are built from: gross portfolio returns, the
+        duration-matched Treasury leg (cash earning cash) and the vendor excess leg."""
+        d = self.daily
+        tsy, vendor = d.get("treasury_leg"), d.get("excess_vendor")
+        if tsy is None and vendor is None:
+            return None
+        return {"gross": self.gross, "treasury": tsy, "vendor": vendor}
+
     def excess(self, freq: str | None = None) -> pd.Series:
+        """Excess returns per period, or aggregated to ``freq`` ("ME", "YE") under the strategy's
+        method: each period's legs compound separately (``COMPOUNDED``: prod(1 + gross) -
+        prod(1 + Treasury leg)), never the per-period differences."""
         if self.excess_returns is None:
             raise ValueError("no excess returns: the source has neither vendor excess returns nor Treasury legs")
         if freq is None:
             return self.excess_returns
-        return self.excess_returns.groupby(pd.Grouper(freq=freq)).apply(lambda g: float((1 + g).prod() - 1))
+        from nautilus_fi.domain.conventions import excess_return_series
+
+        legs = self.excess_legs()
+        if legs is None:
+            return self.excess_returns.groupby(pd.Grouper(freq=freq)).apply(lambda g: float((1 + g).prod() - 1))
+        return excess_return_series(self.gross, legs["treasury"], self.conventions, freq, legs["vendor"])
 
     # ------------------------------------------------------------------ statistics
     def stats(self) -> dict:
         if self._stats is None:
             m = self.strategy.resolved().metrics
             r = self.returns.iloc[1:]
-            b = None if self.benchmark_returns is None else self.benchmark_returns.reindex(r.index).fillna(0.0)
-            s = m.stats(r, self.gross.iloc[1:], self.costs.iloc[1:], b, None if self.risk_free is None else self.risk_free.reindex(r.index), self.trades, self.daily, None if self.excess_returns is None else self.excess_returns.iloc[1:])
+            b = None if self.benchmark_returns is None else self.benchmark_returns.reindex(r.index)          # gaps were resolved by the missing-return policy: any left raise
+            legs = self.excess_legs() if self.excess_returns is not None else None
+            s = m.stats(r, self.gross.iloc[1:], self.costs.iloc[1:], b, None if self.risk_free is None else self.risk_free.reindex(r.index), self.trades, self.daily, None if self.excess_returns is None else self.excess_returns.iloc[1:], None if legs is None else {k: (None if v is None else v.iloc[1:]) for k, v in legs.items()})
             s = {"name": self.name, "fingerprint": self.fingerprint, "fidelity": self.fidelity, "start": str(r.index[0].date()) if len(r) else None, "end": str(r.index[-1].date()) if len(r) else None, "conventions": getattr(self.conventions, "name", None), **s}
             s["hard_violations"] = int((self.violations["severity"] == "HARD").sum()) if len(self.violations) and "severity" in self.violations else 0
             s["missing_zero_filled"] = int(self.missing.get("zero_filled", 0))
+            s["data_fills"] = fill_count(self.missing)
+            for k in ("relaxed_rebalances", "infeasible_rebalances", "aborted_rebalances", "price_tolerance_skips", "pushed_rebalances"):
+                if k in self.diagnostics:
+                    s[k] = int(self.diagnostics[k])
             for k, v in self.diagnostics.get("extra_stats", {}).items():
                 s[k] = v
             self._stats = s
         return dict(self._stats)
+
+    def quality(self) -> dict:
+        """The run-quality summary recorded with every trial: failed (infeasible, aborted, pushed)
+        and relaxed rebalances, data fills, trades skipped on price tolerance, the longest gap
+        between rebalances."""
+        d = self.diagnostics
+        gaps = pd.to_datetime(self.trades["trade_date"]).diff().dt.days.max() if len(self.trades) > 1 else 0
+        return {"failed_rebalances": int(d.get("infeasible_rebalances", 0)) + int(d.get("aborted_rebalances", 0)) + int(d.get("pushed_rebalances", 0)), "relaxed_rebalances": int(d.get("relaxed_rebalances", 0)), "data_fills": fill_count(self.missing), "price_tolerance_skips": int(d.get("price_tolerance_skips", 0)), "max_rebalance_gap_days": 0 if pd.isna(gaps) else int(gaps), "n_rebalances": len(self.trades), "lookahead_checked": bool(d.get("lookahead_checked", True))}
 
     def summary(self) -> pd.Series:
         s = self.stats()

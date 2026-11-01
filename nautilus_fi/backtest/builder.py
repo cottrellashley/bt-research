@@ -148,6 +148,12 @@ class FixedIncomeBacktest:
         m.support = [{"product_family": c.product_family, "feature": c.feature, "status": c.status.value, "approximation": c.approximation, "validation_case": c.validation_case, "notes": c.notes} for c in caps]
         return m
 
+    def _record_spec(self) -> None:
+        """The research spec this run implements, in the manifest (official gates match it to Paper)."""
+        spec = getattr(self.strategy, "spec", None)
+        if self.manifest is not None and spec is not None and getattr(spec, "hash", None) and not self.manifest.spec:
+            self.manifest.spec = {"name": getattr(spec, "name", ""), "hash": spec.hash, "hypothesis_id": getattr(spec, "hypothesis_id", None)}
+
     # ------------------------------------------------------------------ build
     def build(self) -> BacktestEngine:
         register_types()
@@ -208,6 +214,7 @@ class FixedIncomeBacktest:
         strategy.attach(decision, services)
         engine.add_strategy(strategy)
         self.strategy = strategy
+        self._record_spec()
         self.engine = engine
         return engine
 

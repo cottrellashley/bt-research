@@ -4,8 +4,9 @@ viewed, later decisions cannot be relabelled out-of-sample."""
 
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -33,6 +34,13 @@ class Hypothesis:
     validation_period: tuple[str, str]
     holdout_period: tuple[str, str]
     registered_utc: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    content_hash: str = ""                    # set at registration: the hypothesis is frozen by it
+
+
+def hypothesis_hash(h: Hypothesis) -> str:
+    """The content of a hypothesis (everything but its registration stamp and hash)."""
+    body = {k: v for k, v in asdict(h).items() if k not in ("registered_utc", "content_hash")}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 @dataclass
@@ -58,9 +66,36 @@ class ExperimentRegistry:
             self._load()
 
     def register(self, h: Hypothesis) -> Hypothesis:
+        """Store ``h`` as given (in-memory registries, tests). ``register_new`` is the guarded path."""
         self.hypotheses[h.hypothesis_id] = h
         self._save()
         return h
+
+    def register_new(self, h: Hypothesis) -> Hypothesis:
+        """Register a hypothesis once: the registry stamps the registration time (a supplied one is
+        ignored, so it cannot be backdated) and freezes the content by hash; the existence check and
+        the write are one locked step, so concurrent registrations of an id cannot overwrite each other."""
+        h = replace(h, registered_utc=datetime.now(UTC).isoformat(), content_hash="")
+        h = replace(h, content_hash=hypothesis_hash(h))
+        if not self.path:
+            if h.hypothesis_id in self.hypotheses:
+                raise ValueError(f"hypothesis {h.hypothesis_id} already registered; register a new id for a changed hypothesis")
+            self.hypotheses[h.hypothesis_id] = h
+            return h
+        from nautilus_fi.core.fileio import file_lock
+
+        with file_lock(self.path.with_name(self.path.name + ".lock")):
+            self.reload()
+            if h.hypothesis_id in self.hypotheses:
+                raise ValueError(f"hypothesis {h.hypothesis_id} already registered; register a new id for a changed hypothesis")
+            self.hypotheses[h.hypothesis_id] = h
+            self._write()
+        return h
+
+    def frozen(self, hypothesis_id: str) -> bool:
+        """The hypothesis still has the content it was registered with."""
+        h = self.hypotheses.get(hypothesis_id)
+        return h is not None and bool(h.content_hash) and h.content_hash == hypothesis_hash(h)
 
     def record(self, rec: ExperimentRecord) -> ExperimentRecord:
         h = self.hypotheses.get(rec.hypothesis_id)
@@ -93,21 +128,26 @@ class ExperimentRegistry:
         writers never lose each other's hypotheses, records or holdout flags."""
         if not self.path:
             return
-        from nautilus_fi.core.fileio import atomic_write_text, file_lock
+        from nautilus_fi.core.fileio import file_lock
 
         with file_lock(self.path.with_name(self.path.name + ".lock")):
             if self.path.exists():
                 disk = ExperimentRegistry(None)
                 disk.path = self.path
                 disk._load()
-                for k, v in disk.hypotheses.items():
-                    self.hypotheses.setdefault(k, v)
+                for k, v in disk.hypotheses.items():           # a registered hypothesis on disk is never replaced
+                    self.hypotheses[k] = v
                 seen = {_record_key(r) for r in self.records}
                 self.records = [r for r in disk.records if _record_key(r) not in seen] + self.records
                 self.records.sort(key=lambda r: r.created_utc)
                 self.holdout_viewed |= disk.holdout_viewed
-            payload = {"hypotheses": {k: asdict(v) for k, v in self.hypotheses.items()}, "records": [asdict(r) for r in self.records], "holdout_viewed": sorted(self.holdout_viewed)}
-            atomic_write_text(self.path, json.dumps(payload, indent=2, default=str))
+            self._write()
+
+    def _write(self) -> None:
+        from nautilus_fi.core.fileio import atomic_write_text
+
+        payload = {"hypotheses": {k: asdict(v) for k, v in self.hypotheses.items()}, "records": [asdict(r) for r in self.records], "holdout_viewed": sorted(self.holdout_viewed)}
+        atomic_write_text(self.path, json.dumps(payload, indent=2, default=str))
 
     def _load(self) -> None:
         payload = json.loads(self.path.read_text())
@@ -124,4 +164,4 @@ def _record_key(r: ExperimentRecord) -> tuple:
     return (r.hypothesis_id, r.config_hash, r.created_utc, str(r.period), r.note)
 
 
-__all__ = ["ExperimentRecord", "ExperimentRegistry", "HoldoutViolation", "Hypothesis"]
+__all__ = ["ExperimentRecord", "ExperimentRegistry", "HoldoutViolation", "Hypothesis", "hypothesis_hash"]

@@ -111,7 +111,7 @@ def test_terms_free_bonds_with_vendor_prices_and_supplied_cashflows():
 def test_construction_log_records_violations_and_turnover_budget(market):
     corp = {s: b.sector for s, b in market.bonds.items() if b.asset_type.value == "CORPORATE"}
     cons = [Constraint("sector cap", ConstraintKind.GROUP_WEIGHT, "weight", maximum=0.3, group_col="sector"), Constraint("turnover", ConstraintKind.TURNOVER, "per rebalance", maximum=0.25)]
-    res = FixedIncomeBacktest(market, EqualWeightCorporates(EqualWeightCorporatesConfig(rebalance="M", max_names=9)), NET_SPREAD, settings=BacktestSettings(starting_cash=50e6, constraints=cons)).run()
+    res = FixedIncomeBacktest(market, EqualWeightCorporates(EqualWeightCorporatesConfig(rebalance="BMS", max_names=9)), NET_SPREAD, settings=BacktestSettings(starting_cash=50e6, constraints=cons)).run()
     log = res.construction
     assert not log.empty and "summary" in set(log["stage"]) and len(res.fills) > 0
     dropped = log[log["stage"] == "dropped"]
@@ -158,7 +158,7 @@ def test_cash_venue_short_is_rejected_but_margin_venue_carries_it(market):
             self.rebalance_overlays(targets)
 
     for collateral in (10e6, 0.5e6):
-        bt = FixedIncomeBacktest(market, Overlayed(FixedIncomeStrategyConfig(rebalance="M")), NET_SPREAD, settings=BacktestSettings(starting_cash=100e6, margin=MarginSettings(collateral=collateral, book=book, synthetic_shorts={corp[5]})))
+        bt = FixedIncomeBacktest(market, Overlayed(FixedIncomeStrategyConfig(rebalance="BMS")), NET_SPREAD, settings=BacktestSettings(starting_cash=100e6, margin=MarginSettings(collateral=collateral, book=book, synthetic_shorts={corp[5]})))
         r = bt.run()
         nav = r.nav
         assert r.status == "COMPLETED" and r.invariants()["passed"].all()
@@ -175,14 +175,14 @@ def test_cash_venue_short_is_rejected_but_margin_venue_carries_it(market):
 
 
 def test_repo_financed_leverage(market):
-    res = FixedIncomeBacktest(market, EqualWeightCorporates(EqualWeightCorporatesConfig(rebalance="M", invested_fraction=1.4, max_names=10)), NET_SPREAD, settings=BacktestSettings(starting_cash=50e6, funding_policy=FundingPolicy(repo_for_leverage=True))).run()
+    res = FixedIncomeBacktest(market, EqualWeightCorporates(EqualWeightCorporatesConfig(rebalance="BMS", invested_fraction=1.4, max_names=10)), NET_SPREAD, settings=BacktestSettings(starting_cash=50e6, funding_policy=FundingPolicy(repo_for_leverage=True))).run()
     assert res.outcome == "SOLVENT" and (res.nav["gross_exposure"] / res.nav["nav"]).max() > 1.2 and res.nav["repo_balance"].max() > 0
     assert res.cashflows[res.cashflows["type"] == "FINANCING"]["amount"].sum() < 0 and res.invariants()["passed"].all()
 
 
 def test_streaming_incremental_scan_and_reproducible_hashes():
     env = generate_synthetic_market(SyntheticMarketConfig(start=date(2023, 1, 3), end=date(2023, 7, 31), n_treasuries=2, n_bills=1, n_ig=6, n_hy=3, n_frn=1, n_mbs=1, n_linkers=1, seed=11)).build_environment()
-    mk = lambda: EqualWeightEverything(EqualWeightEverythingConfig(rebalance="M"))
+    mk = lambda: EqualWeightEverything(EqualWeightEverythingConfig(rebalance="BMS"))
     a = FixedIncomeBacktest(env, mk, NET_FULL, settings=BacktestSettings(starting_cash=100e6)).run()
     b = FixedIncomeBacktest(env, mk, NET_FULL, settings=BacktestSettings(starting_cash=100e6, stream_days=21)).run()
     c = FixedIncomeBacktest(env, mk, NET_FULL, settings=BacktestSettings(starting_cash=100e6, order_scan="full")).run()
@@ -217,7 +217,7 @@ def test_forced_sale_on_index_removal(panel_env):
         def on_decision(self, d):
             self.rebalance_to_target_faces({target: 500_000.0})
 
-    res = FixedIncomeBacktest(env, HoldForever(FixedIncomeStrategyConfig(rebalance="W")), NET_SPREAD, settings=BacktestSettings(starting_cash=5e6, forced_actions=ForcedActionPolicy(max_rating_score=None, index_removal_action="IMMEDIATE"))).run()
+    res = FixedIncomeBacktest(env, HoldForever(FixedIncomeStrategyConfig(rebalance="WS")), NET_SPREAD, settings=BacktestSettings(starting_cash=5e6, forced_actions=ForcedActionPolicy(max_rating_score=None, index_removal_action="IMMEDIATE"))).run()
     sells = res.fills[(res.fills["symbol"] == target) & (res.fills["side"] == "SELL")]
     assert res.status == "COMPLETED" and len(sells) >= 1                             # sold once it left the index, despite its target
 

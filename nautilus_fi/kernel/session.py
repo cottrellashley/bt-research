@@ -17,7 +17,8 @@ A PM's "what if" is rarely one run. A ``Session`` is the thread those runs belon
 * ``promote(result, level)`` submits a result through the official-record gates.
 
 ``Session(root=...)`` persists the ledger, records and a result cache under ``root``; without a
-root the session lives in a temporary directory.
+root the session lives in a temporary directory. A persistent session without a ``name`` is the
+root's ``"default"`` thread, so reopening it deduplicates against the trials it already recorded.
 """
 
 from __future__ import annotations
@@ -37,13 +38,14 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from nautilus_fi.governance.ledger import TrialLedger
 from nautilus_fi.kernel.data import DataSource, as_source, save_panel
-from nautilus_fi.kernel.engine import Prepared, RunSettings, prepare, simulate
+from nautilus_fi.kernel.engine import Prepared, RunSettings, prepare, settings_key, simulate
 from nautilus_fi.kernel.result import Comparison, Result
-from nautilus_fi.kernel.strategy import Strategy
+from nautilus_fi.kernel.strategy import Strategy, StrategyError
 
 _TEMP_DIRS: list[str] = []
 
@@ -144,9 +146,35 @@ class SweepResult:
         return f"SweepResult({len(self.results)} variants, {self.seconds:.1f}s, {self.mode})\n{self.table().to_string()}"
 
 
+DEFAULT = object()                                   # "the registry's default threshold" (None means not gated)
+_CODE_VERSION: list[str] = []
+
+
+def code_version() -> str:
+    """The package version and, in a git checkout, the commit (``-dirty`` with local changes)."""
+    if not _CODE_VERSION:
+        import subprocess
+
+        from nautilus_fi.version import __version__
+
+        sha = ""
+        try:
+            out = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent), "describe", "--always", "--dirty"], capture_output=True, text=True, timeout=5, check=False)
+            sha = out.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            sha = ""
+        _CODE_VERSION.append(f"{__version__}+{sha}" if sha else __version__)
+    return _CODE_VERSION[0]
+
+
 class Session:
-    def __init__(self, root: str | Path | None = None, source=None, name: str | None = None, hypothesis=None, start=None, end=None, window=None, settings: RunSettings | None = None, cache_bytes: float = 6e9) -> None:
-        self.name = name or f"session-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    def __init__(self, root: str | Path | None = None, source=None, name: str | None = None, hypothesis=None, start=None, end=None, window=None, settings: RunSettings | None = None, cache_bytes: float = 6e9, keep_inputs: bool = False) -> None:
+        """``keep_inputs``: save the prepared panel of each data version under ``root/inputs`` and
+        point every trial at it (the raw inputs, not only their version hash)."""
+        self.keep_inputs = bool(keep_inputs)
+        self._inputs_path = None
+        # a persistent session without a name is the root's "default" thread, so restarts deduplicate
+        self.name = name or ("default" if root is not None else f"session-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}")
         if root is None:
             root = tempfile.mkdtemp(prefix="nfi-session-")
             _TEMP_DIRS.append(root)
@@ -166,7 +194,8 @@ class Session:
             if not isinstance(hypothesis, str) and self.ledger.hypothesis(self.hypothesis) is None:
                 self.ledger.register(hypothesis)
         self._results: dict[str, Result] = {}
-        self._recorded: set[str] = {self._trial_key(t["spec_hash"], tuple(t["period"]), t["stage"]) for t in self.ledger.trials_list() if t.get("session") == self.name}
+        self._recorded: set[str] = {self._trial_key(t["spec_hash"], tuple(t["period"]), t["stage"], t.get("data_version", "")) for t in self.ledger.trials_list() if t.get("session") == self.name}
+        self._warned_unversioned = False
         self._prepared: Prepared | None = None
         self._prep_source: DataSource | None = None
         self._prep_strategies: list[Strategy] = []
@@ -179,9 +208,12 @@ class Session:
             raise ValueError("no data source: pass source= or create the session with Session(source=...)")
         return src
 
-    def key(self, strategy: Strategy, source: DataSource, start, end, fidelity: str) -> str:
-        v = source.version() or f"id{id(source)}"
-        return hashlib.sha256(json.dumps([strategy.fingerprint, v, str(start), str(end), fidelity]).encode()).hexdigest()[:20]
+    def key(self, strategy: Strategy, source: DataSource, start, end, fidelity: str, settings: RunSettings | None = None) -> str:
+        """A result's identity: the strategy, the data version, the window, the fidelity and every
+        run setting that can change its numbers. An unversioned source is keyed by its object (and
+        never cached on disk: another process could hold different data under the same name)."""
+        v = source.version() or f"unversioned:{id(source)}"
+        return hashlib.sha256(json.dumps([strategy.fingerprint, v, str(start), str(end), fidelity, settings_key(settings or self.settings)], default=str).encode()).hexdigest()[:20]
 
     def prepared(self, strategies: list[Strategy], source: DataSource, start, end) -> Prepared:
         """The session's shared data, reloaded only when a strategy needs more."""
@@ -215,6 +247,11 @@ class Session:
 
     def _store(self, key: str, r: Result) -> None:
         self._results[key] = r
+        if not r.source_version:                     # unversioned data: memory only, said once per session
+            if not self._warned_unversioned:
+                self._warned_unversioned = True
+                self.log.append({"note": f"{r.name}: the source has no version(); results are cached in memory only and trials cannot be matched to their data"})
+            return
         if self.persistent:
             try:
                 from nautilus_fi.core.fileio import atomic_write_bytes
@@ -223,37 +260,56 @@ class Session:
             except (pickle.PicklingError, AttributeError, TypeError):    # unpicklable custom code: memory cache only
                 self.log.append({"note": f"{r.name}: not cached on disk (unpicklable custom code)"})
 
+    def _keep(self, prep: Prepared) -> str:
+        tag = hashlib.sha1(str(prep.info.get("source_version") or id(prep)).encode()).hexdigest()[:16]
+        path = self.root / "inputs" / tag
+        if not path.exists():
+            save_panel(prep.panel, path)
+        return str(path)
+
     @staticmethod
-    def _trial_key(fingerprint: str, period: tuple, stage: str) -> str:
-        return f"{fingerprint}|{period[0]}|{period[1]}|{stage}"
+    def _trial_key(fingerprint: str, period: tuple, stage: str, data_version: str = "") -> str:
+        return f"{fingerprint}|{period[0]}|{period[1]}|{stage}|{data_version}"
+
+    def _hypothesis_of(self, strategy: Strategy) -> str | None:
+        hyp = strategy.hypothesis or self.hypothesis
+        if hyp is not None and self.ledger.hypothesis(hyp) is None:
+            raise KeyError(f"hypothesis {hyp!r} is not registered in this session's ledger: register it first (Session(hypothesis=Hypothesis(...)) or session.ledger.register(...)), or drop it from the strategy")
+        return hyp
 
     def _record(self, key: str, r: Result, stage: str) -> None:
-        """One trial per (strategy, period, stage) per session, however often it is run."""
+        """One trial per (strategy, period, stage, data version) per session, however often it is run."""
         rets = r.returns.iloc[1:]
         period = (str(rets.index[0].date()), str(rets.index[-1].date()))
-        tk = self._trial_key(r.fingerprint, period, stage)
+        tk = self._trial_key(r.fingerprint, period, stage, r.source_version or "")
         if tk in self._recorded:
             return
         s = r.strategy
-        hyp = s.hypothesis or self.hypothesis
-        if hyp is not None and self.ledger.hypothesis(hyp) is None:
-            hyp = None
+        hyp = self._hypothesis_of(s)
         summary = {k: v for k, v in r.stats().items() if isinstance(v, (int, float, str, bool)) or v is None}
-        self.ledger.record(stage, r.name, r.fingerprint, s.variant(), period, summary, rets, hyp, r.conventions.to_dict(), False, "COMPLETED", "", session=self.name, description=s.describe())
+        summary.update({f"quality_{k}": v for k, v in r.quality().items()})
+        summary["code_version"] = code_version()
+        if self._inputs_path:
+            summary["inputs"] = self._inputs_path
+        self.ledger.record(stage, r.name, r.fingerprint, s.variant(), period, summary, rets, hyp, r.conventions.to_dict(), False, "COMPLETED", "", session=self.name, description=s.describe(), data_version=r.source_version or "", universe=universe_tag(s))
         self._recorded.add(tk)
 
     # ------------------------------------------------------------------ running
-    def run(self, strategy: Strategy, start=None, end=None, window=None, fidelity: str = "paper", source=None, record: bool = True, settings: RunSettings | None = None, **implement_kw) -> Result:
+    def run(self, strategy: Strategy, start=None, end=None, window=None, fidelity: str = "paper", source=None, record: bool = True, settings: RunSettings | None = None, stage: str | None = None, **implement_kw) -> Result:
         """Run (or fetch from the cache) one strategy; every new run is a trial in the ledger."""
         src = self._source(source)
         start, end = _window(start, end, window) if (start is not None or end is not None or window is not None) else (self.start, self.end)
-        key = self.key(strategy, src, start, end, fidelity)
+        if record:
+            self._hypothesis_of(strategy)                 # refuse before running, not after
+        key = self.key(strategy, src, start, end, fidelity, settings)
         hit = self._cached(key)
         t0 = time.perf_counter()
         if hit is None:
             if fidelity == "paper":
                 prep = self.prepared([strategy], src, start, end)
                 hit = simulate(strategy, prep, start, end, settings or self.settings)
+                if self.keep_inputs and self.persistent:
+                    self._inputs_path = self._keep(prep)
             elif fidelity == "implement":
                 from nautilus_fi.kernel.implement import run_implement
 
@@ -265,7 +321,7 @@ class Session:
         else:
             cached = True
         if record:
-            self._record(key, hit, "PAPER" if fidelity == "paper" else "IMPLEMENT")
+            self._record(key, hit, stage or ("PAPER" if fidelity == "paper" else "IMPLEMENT"))
         self.log.append({"name": hit.name, "fingerprint": hit.fingerprint, "fidelity": fidelity, "cached": cached, "seconds": time.perf_counter() - t0, "key": key})
         return hit
 
@@ -355,21 +411,70 @@ class Session:
         return self.ledger.pbo(None, n_splits, ("PAPER", "VALIDATION"), session=self.name)
 
     # ------------------------------------------------------------------ governance
-    def promote(self, result: Result, level: str = "CANDIDATE", implement: Result | None = None, reconciliation: dict | None = None, registry_root: str | Path | None = None):
+    def promote(self, result: Result, level: str = "CANDIDATE", implement: Result | None = None, reconciliation: dict | None = None, registry_root: str | Path | None = None, min_dsr=DEFAULT, max_pbo=DEFAULT, thresholds: dict | None = None, links: dict | None = None):
         """Submit through the official-record gates (``governance.RecordRegistry``); raises
-        ``GateFailure`` listing every failed check."""
+        ``GateFailure`` listing every failed check. ``min_dsr`` / ``max_pbo`` (and ``thresholds``:
+        ``min_years``, reconciliation tolerances) override the registry's defaults; None records
+        the value without gating it. ``links``: the operational store's ids for the record
+        (portfolio, PORT id, config version, owner, attachments: ``governance.LINK_KEYS``); the
+        strategy's code is recorded with it when it can be saved as code."""
         from nautilus_fi.governance.records import RecordLevel, RecordRegistry
 
-        reg = RecordRegistry(registry_root or (self.root / "records"))
+        kw = {k: v for k, v in (("min_dsr", min_dsr), ("max_pbo", max_pbo)) if v is not DEFAULT}
+        reg = RecordRegistry(registry_root or (self.root / "records"), **{**kw, **(thresholds or {})})
         lvl = level if isinstance(level, RecordLevel) else RecordLevel(str(level).upper())
-        spec = _SpecProxy(result.fingerprint, result.strategy.hypothesis or self.hypothesis)
+        spec = _SpecProxy(result.fingerprint, result.strategy.hypothesis or self.hypothesis, universe_tag(result.strategy), result.source_version or "")
         raw = implement.raw if implement is not None else None
         if implement is not None and reconciliation is None:
             from nautilus_fi.kernel.implement import reconcile
 
             reconciliation = reconcile(result, implement, source=self.source, prepared=self._prepared).summary
         data = {"source_version": result.source_version or "", "fingerprint": result.fingerprint}
-        return reg.submit(lvl, result, spec, self.ledger, raw, reconciliation, data, result.name)
+        evidence = {}
+        if reg.min_lag_stress is not None and lvl != RecordLevel.EXPLORATORY:
+            evidence["lag_stress"] = self.lag_stress(result.strategy).reset_index().to_dict("records")
+        try:
+            config = result.strategy.to_code()
+        except StrategyError:                                           # custom code: the source file is the config
+            config = None
+        return reg.submit(lvl, result, spec, self.ledger, raw, reconciliation, data, result.name, None if implement is None else implement.fingerprint, evidence=evidence, links=links, config=config)
+
+    def breakeven(self, strategy, multipliers=(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0), baseline=None, metric: str = "annual_return", **run_kw) -> dict:
+        """Cost breakeven: ``metric`` with the execution costs scaled by each multiplier (absolute,
+        or minus ``baseline``'s at the same multiplier), and the multiplier where it crosses zero
+        (linear interpolation; None when it never does). Robustness runs: not counted as trials."""
+        s = strategy.strategy if isinstance(strategy, Result) else strategy
+        b = baseline.strategy if isinstance(baseline, Result) else baseline
+        rows = []
+        for k in multipliers:
+            def at(x, k=k):
+                v = x.with_(execution=dataclasses.replace(x.execution, cost=x.execution.cost * float(k)), name=f"{x.name}[costs x{k:g}]")
+                return self.run(v, record=False, **run_kw).stats().get(metric)
+            val = at(s)
+            base = at(b) if b is not None else 0.0
+            rows.append({"multiplier": float(k), metric: val, "baseline": base if b is not None else None, "edge": None if val is None or base is None else val - base})
+        table = pd.DataFrame(rows).set_index("multiplier")
+        e = table["edge"].astype(float)
+        cross = None
+        for (k0, v0), (k1, v1) in zip(e.items(), list(e.items())[1:], strict=False):
+            if np.isfinite(v0) and np.isfinite(v1) and v0 > 0 >= v1:
+                cross = float(k0 + (k1 - k0) * v0 / (v0 - v1))
+                break
+        return {"table": table, "breakeven_multiplier": cross, "metric": metric, "versus": "zero" if b is None else b.name}
+
+    def lag_stress(self, strategy, lags=(0, 1, 2, 3), metric: str = "sharpe", **run_kw) -> pd.DataFrame:
+        """The strategy (or a result's strategy) at each execution lag, outside the trial count
+        (a robustness check, not a selection): ``metric`` per lag and its ratio to the strategy's own lag."""
+        s = strategy.strategy if isinstance(strategy, Result) else strategy
+        rows = []
+        for lag in lags:
+            r = self.run(s.with_(execution=dataclasses.replace(s.execution, lag=int(lag)), name=f"{s.name}[lag {int(lag)}]"), record=False, **run_kw)
+            st = r.stats()
+            rows.append({"lag": int(lag), metric: st.get(metric), "annual_return": st.get("annual_return"), "turnover": st.get("turnover")})
+        out = pd.DataFrame(rows).set_index("lag")
+        own = out[metric].get(int(s.execution.lag), float("nan"))
+        out["ratio_to_own_lag"] = out[metric] / own if own else float("nan")
+        return out
 
     def summary(self) -> str:
         t = self.trials()
@@ -383,6 +488,14 @@ class Session:
 class _SpecProxy:
     hash: str
     hypothesis_id: str | None
+    universe: str = ""
+    data_version: str = ""
+
+
+def universe_tag(strategy: Strategy) -> str:
+    """The universe a trial selected from, as recorded in the ledger (search-scope matching)."""
+    s = strategy.resolved()
+    return repr(s.universe) if s.universe is not None else ""
 
 
 # ====================================================================================== parallel sweeps

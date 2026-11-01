@@ -1,12 +1,252 @@
 {
-  "variables": {"database": "FIATLAS", "schema": "CREDIT"},
+  "variables": {
+    "database": "FIATLAS",
+    "schema": "CREDIT"
+  },
   "datasets": [
-    {"name": "reference", "query": "SELECT * FROM {database}.{schema}.BOND_REFERENCE", "columns": {"symbol": "CUSIP", "issuer": "ISSUER_TICKER", "issue_date": "ISSUE_DATE", "maturity": "MATURITY_DATE", "coupon_rate": "COUPON", "currency": "CURRENCY", "sector": "SECTOR_L3", "rating_initial": "RATING_COMPOSITE", "amount_outstanding": "AMT_OUTSTANDING", "min_piece": "MIN_PIECE", "increment": "MIN_INCREMENT", "terms_source": "TERMS_SOURCE"}, "scale": {"coupon_rate": 0.01}, "date_column": "issue_date", "description": "terms; TERMS_SOURCE = VENDOR for terms-free bonds"},
-    {"name": "evaluated_prices", "query": "SELECT * FROM {database}.{schema}.BOND_PRICES_DAILY WHERE PRICE_DATE BETWEEN :start AND :end", "columns": {"date": "PRICE_DATE", "instrument_id": "CUSIP", "mid": "PX_MID_CLEAN", "bid": "PX_BID_CLEAN", "ask": "PX_ASK_CLEAN", "accrued": "ACCRUED", "score": "BVAL_SCORE", "source": "PRICE_SOURCE"}, "knowledge_time_column": "LOAD_TS", "description": "evaluated prices with vendor accrued"},
-    {"name": "analytics", "query": "SELECT * FROM {database}.{schema}.BOND_ANALYTICS_DAILY WHERE AS_OF_DATE BETWEEN :start AND :end", "columns": {"date": "AS_OF_DATE", "instrument_id": "CUSIP", "oas_bp": "OAS", "oad": "OAD", "oasd": "OASD", "ytw": "YTW", "convexity": "CONVEXITY", "krd_2": "KRD_2Y", "krd_5": "KRD_5Y", "krd_10": "KRD_10Y", "krd_30": "KRD_30Y"}, "scale": {"ytw": 0.01}, "knowledge_time_column": "LOAD_TS", "description": "vendor OAS / OAD / OASD / KRD"},
-    {"name": "fields", "query": "SELECT * FROM {database}.{schema}.BOND_RETURNS_DAILY WHERE AS_OF_DATE BETWEEN :start AND :end", "columns": {"date": "AS_OF_DATE", "instrument_id": "CUSIP", "tr": "TOTAL_RETURN", "xr": "EXCESS_RETURN"}, "scale": {"tr": 0.01, "xr": 0.01}, "knowledge_time_column": "LOAD_TS", "description": "vendor daily total and excess returns (percent)"},
-    {"name": "benchmark_constituents", "query": "SELECT * FROM {database}.{schema}.INDEX_CONSTITUENTS WHERE INDEX_CODE = :index_code AND REBALANCE_DATE BETWEEN :start AND :end", "columns": {"date": "REBALANCE_DATE", "instrument_id": "CUSIP", "weight": "INDEX_WEIGHT"}, "params": {"index_code": "LUACTRUU"}, "scale": {"weight": 0.01}, "description": "index constituents and weights per reconstitution (percent)"},
-    {"name": "ratings", "query": "SELECT * FROM {database}.{schema}.RATING_HISTORY WHERE EFFECTIVE_DATE BETWEEN :start AND :end", "columns": {"date": "EFFECTIVE_DATE", "instrument_id": "CUSIP", "rating": "RATING_COMPOSITE"}, "knowledge_time_column": "ANNOUNCE_TS", "description": "point-in-time composite ratings"},
-    {"name": "curves", "query": "SELECT * FROM {database}.{schema}.TREASURY_CURVE WHERE CURVE_DATE BETWEEN :start AND :end", "columns": {"date": "CURVE_DATE", "curve": "CURVE_NAME", "tenor": "TENOR_YEARS", "rate": "PAR_YIELD"}, "scale": {"rate": 0.01}, "description": "Treasury par curve (percent)"}
-  ]
+    {
+      "name": "reference",
+      "query": "SELECT * FROM {database}.{schema}.BOND_REFERENCE",
+      "columns": {
+        "symbol": "CUSIP",
+        "issuer": "ISSUER_TICKER",
+        "issue_date": "ISSUE_DATE",
+        "maturity": "MATURITY_DATE",
+        "coupon_rate": "COUPON",
+        "currency": "CURRENCY",
+        "sector": "SECTOR_L3",
+        "rating_initial": "RATING_COMPOSITE",
+        "amount_outstanding": "AMT_OUTSTANDING",
+        "min_piece": "MIN_PIECE",
+        "increment": "MIN_INCREMENT",
+        "terms_source": "TERMS_SOURCE"
+      },
+      "scale": {
+        "coupon_rate": 0.01
+      },
+      "date_column": "issue_date",
+      "description": "terms; TERMS_SOURCE = VENDOR for terms-free bonds"
+    },
+    {
+      "name": "evaluated_prices",
+      "query": "SELECT * FROM {database}.{schema}.BOND_PRICES_DAILY WHERE PRICE_DATE BETWEEN :start AND :end",
+      "columns": {
+        "date": "PRICE_DATE",
+        "instrument_id": "CUSIP",
+        "mid": "PX_MID_CLEAN",
+        "bid": "PX_BID_CLEAN",
+        "ask": "PX_ASK_CLEAN",
+        "accrued": "ACCRUED",
+        "score": "BVAL_SCORE",
+        "source": "PRICE_SOURCE"
+      },
+      "knowledge_time_column": "LOAD_TS",
+      "description": "evaluated prices with vendor accrued"
+    },
+    {
+      "name": "analytics",
+      "query": "SELECT * FROM {database}.{schema}.BOND_ANALYTICS_DAILY WHERE AS_OF_DATE BETWEEN :start AND :end",
+      "columns": {
+        "date": "AS_OF_DATE",
+        "instrument_id": "CUSIP",
+        "oas_bp": "OAS",
+        "oad": "OAD",
+        "oasd": "OASD",
+        "ytw": "YTW",
+        "convexity": "CONVEXITY",
+        "krd_2": "KRD_2Y",
+        "krd_5": "KRD_5Y",
+        "krd_10": "KRD_10Y",
+        "krd_30": "KRD_30Y"
+      },
+      "scale": {
+        "ytw": 0.01
+      },
+      "knowledge_time_column": "LOAD_TS",
+      "description": "vendor OAS / OAD / OASD / KRD"
+    },
+    {
+      "name": "fields",
+      "query": "SELECT * FROM {database}.{schema}.BOND_RETURNS_DAILY WHERE AS_OF_DATE BETWEEN :start AND :end",
+      "columns": {
+        "date": "AS_OF_DATE",
+        "instrument_id": "CUSIP",
+        "tr": "TOTAL_RETURN",
+        "xr": "EXCESS_RETURN"
+      },
+      "scale": {
+        "tr": 0.01,
+        "xr": 0.01
+      },
+      "knowledge_time_column": "LOAD_TS",
+      "description": "vendor daily total and excess returns (percent)"
+    },
+    {
+      "name": "benchmark_constituents",
+      "query": "SELECT * FROM {database}.{schema}.INDEX_CONSTITUENTS WHERE INDEX_CODE = :index_code AND REBALANCE_DATE BETWEEN :start AND :end",
+      "columns": {
+        "date": "REBALANCE_DATE",
+        "instrument_id": "CUSIP",
+        "weight": "INDEX_WEIGHT"
+      },
+      "params": {
+        "index_code": "LUACTRUU"
+      },
+      "scale": {
+        "weight": 0.01
+      },
+      "description": "index constituents and weights per reconstitution (percent)"
+    },
+    {
+      "name": "ratings",
+      "query": "SELECT * FROM {database}.{schema}.RATING_HISTORY WHERE EFFECTIVE_DATE BETWEEN :start AND :end",
+      "columns": {
+        "date": "EFFECTIVE_DATE",
+        "instrument_id": "CUSIP",
+        "rating": "RATING_COMPOSITE"
+      },
+      "knowledge_time_column": "ANNOUNCE_TS",
+      "description": "point-in-time composite ratings"
+    },
+    {
+      "name": "curves",
+      "query": "SELECT * FROM {database}.{schema}.TREASURY_CURVE WHERE CURVE_DATE BETWEEN :start AND :end",
+      "columns": {
+        "date": "CURVE_DATE",
+        "curve": "CURVE_NAME",
+        "tenor": "TENOR_YEARS",
+        "rate": "PAR_YIELD"
+      },
+      "scale": {
+        "rate": 0.01
+      },
+      "description": "Treasury par curve (percent)"
+    },
+    {
+      "name": "benchmark_constituents_lf98truu",
+      "query": "SELECT * FROM {database}.{schema}.INDEX_CONSTITUENTS WHERE INDEX_CODE = :index_code AND REBALANCE_DATE BETWEEN :start AND :end",
+      "columns": {
+        "date": "REBALANCE_DATE",
+        "instrument_id": "CUSIP",
+        "weight": "INDEX_WEIGHT"
+      },
+      "params": {
+        "index_code": "LF98TRUU"
+      },
+      "scale": {
+        "weight": 0.01
+      },
+      "description": "Bloomberg US Corporate High Yield: constituents and weights per reconstitution (percent); template, confirm the code"
+    },
+    {
+      "name": "benchmark_constituents_lecptreu",
+      "query": "SELECT * FROM {database}.{schema}.INDEX_CONSTITUENTS WHERE INDEX_CODE = :index_code AND REBALANCE_DATE BETWEEN :start AND :end",
+      "columns": {
+        "date": "REBALANCE_DATE",
+        "instrument_id": "CUSIP",
+        "weight": "INDEX_WEIGHT"
+      },
+      "params": {
+        "index_code": "LECPTREU"
+      },
+      "scale": {
+        "weight": 0.01
+      },
+      "description": "Bloomberg Euro-Aggregate Corporate (EU IG): constituents and weights per reconstitution (percent); template, confirm the code"
+    },
+    {
+      "name": "benchmark_constituents_lp01treu",
+      "query": "SELECT * FROM {database}.{schema}.INDEX_CONSTITUENTS WHERE INDEX_CODE = :index_code AND REBALANCE_DATE BETWEEN :start AND :end",
+      "columns": {
+        "date": "REBALANCE_DATE",
+        "instrument_id": "CUSIP",
+        "weight": "INDEX_WEIGHT"
+      },
+      "params": {
+        "index_code": "LP01TREU"
+      },
+      "scale": {
+        "weight": 0.01
+      },
+      "description": "Bloomberg Pan-European High Yield (EU HY): constituents and weights per reconstitution (percent); template, confirm the code"
+    },
+    {
+      "name": "benchmark_constituents_jbcdcomp",
+      "query": "SELECT * FROM {database}.{schema}.INDEX_CONSTITUENTS WHERE INDEX_CODE = :index_code AND REBALANCE_DATE BETWEEN :start AND :end",
+      "columns": {
+        "date": "REBALANCE_DATE",
+        "instrument_id": "CUSIP",
+        "weight": "INDEX_WEIGHT"
+      },
+      "params": {
+        "index_code": "JBCDCOMP"
+      },
+      "scale": {
+        "weight": 0.01
+      },
+      "description": "J.P. Morgan CEMBI Broad Diversified (EM corporates): constituents and weights per reconstitution (percent); template, confirm the code"
+    },
+    {
+      "name": "benchmark_constituents_ld08truu",
+      "query": "SELECT * FROM {database}.{schema}.INDEX_CONSTITUENTS WHERE INDEX_CODE = :index_code AND REBALANCE_DATE BETWEEN :start AND :end",
+      "columns": {
+        "date": "REBALANCE_DATE",
+        "instrument_id": "CUSIP",
+        "weight": "INDEX_WEIGHT"
+      },
+      "params": {
+        "index_code": "LD08TRUU"
+      },
+      "scale": {
+        "weight": 0.01
+      },
+      "description": "Bloomberg US Corporate 1-5 Year (short duration): constituents and weights per reconstitution (percent); template, confirm the code"
+    },
+    {
+      "name": "benchmark_constituents_lec1treu",
+      "query": "SELECT * FROM {database}.{schema}.INDEX_CONSTITUENTS WHERE INDEX_CODE = :index_code AND REBALANCE_DATE BETWEEN :start AND :end",
+      "columns": {
+        "date": "REBALANCE_DATE",
+        "instrument_id": "CUSIP",
+        "weight": "INDEX_WEIGHT"
+      },
+      "params": {
+        "index_code": "LEC1TREU"
+      },
+      "scale": {
+        "weight": 0.01
+      },
+      "description": "Bloomberg Euro-Aggregate Corporate 1-3 Year (short duration): constituents and weights per reconstitution (percent); template, confirm the code"
+    }
+  ],
+  "indices": {
+    "LUACTRUU": {
+      "description": "Bloomberg US Corporate (IG)",
+      "confirm": "index code and constituent table to be confirmed against the deployed FIAtlas views"
+    },
+    "LF98TRUU": {
+      "description": "Bloomberg US Corporate High Yield",
+      "confirm": "index code and constituent table to be confirmed against the deployed FIAtlas views"
+    },
+    "LECPTREU": {
+      "description": "Bloomberg Euro-Aggregate Corporate (EU IG)",
+      "confirm": "index code and constituent table to be confirmed against the deployed FIAtlas views"
+    },
+    "LP01TREU": {
+      "description": "Bloomberg Pan-European High Yield (EU HY)",
+      "confirm": "index code and constituent table to be confirmed against the deployed FIAtlas views"
+    },
+    "JBCDCOMP": {
+      "description": "J.P. Morgan CEMBI Broad Diversified (EM corporates)",
+      "confirm": "index code and constituent table to be confirmed against the deployed FIAtlas views"
+    },
+    "LD08TRUU": {
+      "description": "Bloomberg US Corporate 1-5 Year (short duration)",
+      "confirm": "index code and constituent table to be confirmed against the deployed FIAtlas views"
+    },
+    "LEC1TREU": {
+      "description": "Bloomberg Euro-Aggregate Corporate 1-3 Year (short duration)",
+      "confirm": "index code and constituent table to be confirmed against the deployed FIAtlas views"
+    }
+  }
 }

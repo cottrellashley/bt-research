@@ -65,10 +65,13 @@ class PointInTimeStore:
             return snaps
         as_of = pd.Timestamp(as_of)
         as_of = as_of.tz_localize("UTC") if as_of.tzinfo is None else as_of.tz_convert("UTC")
-        return [(kt, p) for kt, p in snaps if kt <= as_of]
+        from nautilus_fi.data.field_store import known_at
+
+        return [(kt, p) for kt, p in snaps if known_at(kt, as_of)]
 
     def read(self, dataset: str, as_of: pd.Timestamp | None = None) -> pd.DataFrame:
-        """Latest snapshot whose knowledge time is <= ``as_of`` (all history if ``as_of`` is None)."""
+        """Latest snapshot known at ``as_of``: knowledge time strictly before it unless
+        ``field_store.AS_OF_INCLUSIVE`` (all history if ``as_of`` is None)."""
         known = self._known(dataset, as_of)
         if not known:
             raise FileNotFoundError(f"No snapshot of {dataset!r} known at {as_of}")

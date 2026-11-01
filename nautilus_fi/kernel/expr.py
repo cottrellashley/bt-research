@@ -279,12 +279,21 @@ class EvalContext:
         return "" if self.rows is None else hashlib.sha1(np.asarray(self.rows, dtype=np.int64).tobytes()).hexdigest()[:10]
 
     # ------------------------------------------------------------------ data
-    def lag_of(self, name: str) -> int:
-        if name in self.lags:
-            return int(self.lags[name])
+    def label_of(self, name: str) -> str:
+        """``"start"`` for a field whose values are stamped with the start of the period they cover."""
         if self.catalog is not None and name in self.catalog:
-            return int(self.catalog[name].lag)
-        return int(self.panel.lags.get(name, 0))
+            return getattr(self.catalog[name], "label", "end")
+        return "end"
+
+    def lag_of(self, name: str) -> int:
+        """Rows after its stamp a value may inform a decision: the availability lag, plus one for a
+        start-labelled value (it covers the period after its stamp, known only at that period's end)."""
+        extra = 1 if self.label_of(name) == "start" else 0
+        if name in self.lags:
+            return int(self.lags[name]) + extra
+        if self.catalog is not None and name in self.catalog:
+            return int(self.catalog[name].lag) + extra
+        return int(self.panel.lags.get(name, 0)) + extra
 
     def has(self, name: str) -> bool:
         return name in self.panel or name in self.attributes.columns or name in self.series.columns
@@ -299,16 +308,44 @@ class EvalContext:
         return UnknownFieldError(name, kind, sugg, getattr(self.source, "name", ""))
 
     def field(self, name: str, lag: int | None = None) -> np.ndarray:
-        key = f"{self.token}|field:{name}|lag:{lag}"
+        if name not in self.panel:
+            raise self.unknown(name)
+        n = self.lag_of(name) if lag is None else int(lag)
+        key = f"{self.token}|field:{name}|lag:{n}"          # one entry per effective lag (realised and known reads share it at lag 0)
         hit = self.cache.get(key)
         if hit is not None:
             return hit
-        if name not in self.panel:
-            raise self.unknown(name)
         raw = self.panel[name]
         v = raw if raw.dtype == np.float64 else raw.astype(np.float64)
-        n = self.lag_of(name) if lag is None else int(lag)
         out = shift_rows(np.asarray(v), n) if n else np.asarray(v)
+        self.cache.put(key, out)
+        return out
+
+    def form_of(self, name: str) -> str:
+        if self.catalog is not None and name in self.catalog:
+            return getattr(self.catalog[name], "form", "simple")
+        return "simple"
+
+    def realised(self, name: str) -> np.ndarray:
+        """``name`` as realised, without the availability lag: row ``t`` is the value for the period
+        ending on date ``t`` (a start-labelled field moves one row later), as a simple return per
+        period whatever form it was declared in (log returns, price levels or additive cumulative
+        returns are converted). Returns, the legs of excess returns and refills are outcomes, read
+        this way; the lag governs only what a decision may see (``field``)."""
+        v = self.field(name, 1 if self.label_of(name) == "start" else 0)
+        form = self.form_of(name)
+        if form == "simple":
+            return v
+        key = f"{self.token}|realised:{name}|{form}"
+        hit = self.cache.get(key)
+        if hit is not None:
+            return hit
+        if form == "log":
+            out = np.expm1(v)
+        elif form == "price":
+            out = v / shift_rows(v, 1) - 1.0
+        else:
+            out = v - shift_rows(v, 1)
         self.cache.put(key, out)
         return out
 
@@ -343,7 +380,10 @@ class EvalContext:
         if by in self.attributes.columns:
             out = factorize(self.attributes[by].tolist())
         elif by in self.panel:
-            out = _numeric_to_cat(self.field(by))
+            out = _numeric_to_cat(self.field(by))                            # dated categories: point in time, as known
+            labels = getattr(self.catalog[by], "categories", ()) if (self.catalog is not None and by in self.catalog) else ()
+            if labels:
+                out.categories = [labels[int(c)] if 0 <= int(c) < len(labels) else str(c) for c in out.categories]
         else:
             raise self.unknown(by, "group attribute")
         self.cache.put(key, out)
@@ -634,8 +674,10 @@ class Expr:
     def ewm(self, halflife: float, min_periods: int = 1) -> _EwmBuilder:
         return _EwmBuilder(self, float(halflife), int(min_periods))
 
-    def ffill(self, limit: int | None = None) -> Expr:
-        return FFill(self, limit)
+    def ffill(self, limit: int | None = None, days: int | None = None) -> Expr:
+        """Carry the last value forward: at most ``limit`` rows, and/or at most ``days`` calendar days
+        old (MRI v2 carries inputs 5 days, Erin 7); unbounded otherwise (all history is loaded)."""
+        return FFill(self, limit, days)
 
     def cumsum(self) -> Expr:
         return CumSum(self)
@@ -649,6 +691,10 @@ class Expr:
 
     def demean(self, by=None) -> Expr:
         return Demean(self, _by(by))
+
+    def cs_quantile(self, q: float) -> Expr:
+        """The cross-sectional ``q`` quantile per date within the universe, broadcast."""
+        return CSQuantile(self, q)
 
     def winsor(self, lower: float = 0.01, upper: float | None = None) -> Expr:
         return Winsor(self, float(lower), float(1.0 - lower if upper is None else upper))
@@ -784,6 +830,41 @@ class All(Expr):
         return "All()"
 
 
+class Available(Expr):
+    """True where ``name`` has a published history: within its catalogue window (``FieldInfo.start``
+    to ``end``) and, for a panel field, from its first value on. Guard a rule on a field that starts
+    later than the run (ESG, analyst views): ``~Available("esg") | (Field("esg") > 3)``; reading such
+    a field unguarded before its start is refused."""
+
+    kind = "bool"
+
+    def __init__(self, name: str) -> None:
+        self.name = str(name)
+
+    def _params(self):
+        return [self.name]
+
+    def _own_names(self):
+        return {self.name}
+
+    def _eval(self, ctx):
+        T, N = ctx.T, ctx.N
+        ok = np.ones((T, N), dtype=bool)
+        info = ctx.catalog.get(self.name) if ctx.catalog is not None else None
+        dates = ctx.panel.dates
+        if info is not None and info.start:
+            ok &= np.asarray(dates >= pd.Timestamp(info.start))[:, None]
+        if info is not None and info.end:
+            ok &= np.asarray(dates <= pd.Timestamp(info.end))[:, None]
+        if self.name in ctx.panel:
+            seen = np.maximum.accumulate(np.isfinite(ctx.field(self.name)), axis=0)
+            ok &= seen
+        return ok
+
+    def __repr__(self) -> str:
+        return f"Available({self.name!r})"
+
+
 def alive_mask(ctx: EvalContext) -> np.ndarray:
     key = f"{ctx.token}|alive|{ctx.return_field}"
     hit = ctx.cache.get(key)
@@ -792,7 +873,7 @@ def alive_mask(ctx: EvalContext) -> np.ndarray:
     if "alive" in ctx.panel:
         out = np.nan_to_num(np.asarray(ctx.panel["alive"], dtype=np.float64)) > 0
     elif ctx.return_field in ctx.panel:
-        fin = np.isfinite(np.asarray(ctx.panel[ctx.return_field], dtype=np.float64))
+        fin = np.isfinite(np.asarray(ctx.realised(ctx.return_field), dtype=np.float64))
         T = ctx.T
         first = np.where(fin.any(axis=0), fin.argmax(axis=0), T)
         last = np.where(fin.any(axis=0), T - 1 - fin[::-1].argmax(axis=0), -1)
@@ -1174,20 +1255,40 @@ class _EwmBuilder:
         return EWM(self.a, self.halflife, "std", self.min_periods)
 
 
+UNBOUNDED = 10 ** 9                  # look-back of a node that depends on all history (load from the first observation)
+
+
 class FFill(Expr):
-    def __init__(self, a, limit: int | None = None) -> None:
-        self.a, self.limit = lift(a), limit
+    def __init__(self, a, limit: int | None = None, days: int | None = None) -> None:
+        self.a, self.limit, self.days = lift(a), limit, (None if days is None else int(days))
         self._children = (self.a,)
 
+    def _params(self):
+        return [self.limit] + ([] if self.days is None else [self.days])
+
     def __repr__(self) -> str:
-        return f"{self.a!r}.ffill({'' if self.limit is None else self.limit})"
+        args = ([] if self.limit is None else [str(self.limit)]) + ([] if self.days is None else [f"days={self.days}"])
+        return f"{self.a!r}.ffill({', '.join(args)})"
 
     def _own_lookback(self):
-        return self.limit or 0
+        if self.limit is None and self.days is None:
+            return UNBOUNDED                                   # an unbounded carry needs every earlier value
+        rows = [int(self.limit)] if self.limit is not None else []
+        if self.days is not None:
+            rows.append(int(np.ceil(self.days * 5 / 7)) + 1)
+        return min(rows)
 
     def _eval(self, ctx):
         a = np.asarray(self.a.evaluate(ctx.full()), dtype=np.float64)
-        return pd.DataFrame(a).ffill(limit=self.limit).to_numpy()
+        out = pd.DataFrame(a).ffill(limit=self.limit).to_numpy()
+        if self.days is not None:                              # calendar-day staleness, not rows
+            T = a.shape[0]
+            idx = np.where(np.isfinite(a), np.arange(T)[:, None], -1)
+            last = np.maximum.accumulate(idx, axis=0)
+            d = ctx.panel.dates.values.astype("datetime64[D]").astype(np.int64)
+            age = d[:, None] - np.where(last >= 0, d[np.clip(last, 0, None)], np.iinfo(np.int64).min // 2)
+            out = np.where(age <= self.days, out, np.nan)
+        return out
 
 
 class CumSum(Expr):
@@ -1197,6 +1298,9 @@ class CumSum(Expr):
 
     def __repr__(self) -> str:
         return f"{self.a!r}.cumsum()"
+
+    def _own_lookback(self):
+        return UNBOUNDED
 
     def _eval(self, ctx):
         a = np.asarray(self.a.evaluate(ctx.full()), dtype=np.float64)
@@ -1236,6 +1340,32 @@ class Rank(_CS):
         x = a if self.ascending else -a
         valid = self._valid(ctx, a)
         return grouped_rank(np.where(valid, x, np.nan), ctx.groups(self.by), ctx.T, ctx.N)
+
+
+class CSQuantile(_CS):
+    """The cross-sectional ``q`` quantile per date within the universe (``@universe.oas.p90``),
+    broadcast to every instrument: ``Field("oas_bp") < Field("oas_bp").cs_quantile(0.9)``."""
+
+    def __init__(self, a, q: float) -> None:
+        self.a, self.q = lift(a), float(q)
+        self._children = (self.a,)
+
+    def _params(self):
+        return [self.q]
+
+    def __repr__(self) -> str:
+        return f"{self.a!r}.cs_quantile({self.q:g})"
+
+    def _eval(self, ctx):
+        a = np.asarray(self.a.evaluate(ctx), dtype=np.float64)
+        v = np.where(self._valid(ctx, a), a, np.nan)
+        with np.errstate(all="ignore"):
+            import warnings as _w
+
+            with _w.catch_warnings():
+                _w.simplefilter("ignore", RuntimeWarning)
+                qv = np.nanquantile(v, self.q, axis=1)
+        return np.broadcast_to(qv[:, None], (ctx.T, ctx.N))
 
 
 def grouped_rank(x: np.ndarray, g: Cat, T: int, N: int, method: str = "average") -> np.ndarray:
@@ -1627,6 +1757,8 @@ __all__ = [
     "All",
     "Apply",
     "Attribute",
+    "Available",
+    "CSQuantile",
     "Cat",
     "Combine",
     "Const",

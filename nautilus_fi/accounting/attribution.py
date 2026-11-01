@@ -8,7 +8,6 @@ alpha."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -43,21 +42,23 @@ class AttributionInputs:
 
 
 def attribute_instrument(x: AttributionInputs) -> dict[str, float]:
-    """Sequential decomposition in local currency then translated; returns components plus the total."""
+    """Sequential decomposition in local currency then translated; returns components plus the total.
+
+    Carry is the income at constant yield when ``ytm_prev`` is given (accrual and coupons plus the
+    roll-down / pull to par, ``ytm_prev x dirty_prev x days / 365.25``), else accrual and coupons.
+    Rates and spread are duration times the moves; the price change they and the roll-down leave is
+    optionality / behaviour, and without moves it is residual."""
     scale = x.face / 100.0
     total_local = ((x.clean_now + x.accrued_now + x.coupon_cash) - (x.clean_prev + x.accrued_prev)) * scale
-    carry = (x.accrued_now - x.accrued_prev + x.coupon_cash) * scale
+    income = (x.accrued_now - x.accrued_prev + x.coupon_cash) * scale
+    rolldown = 0.0
     if x.ytm_prev is not None and x.carry_days:
-        # roll-down / pull-to-par approximation at constant yield
-        carry += ((x.ytm_prev * (x.clean_prev + x.accrued_prev) - 0.0) * x.carry_days / 365.25 - (x.accrued_now - x.accrued_prev + x.coupon_cash)) * scale * 0.0
+        rolldown = x.ytm_prev * (x.clean_prev + x.accrued_prev) * x.carry_days / 365.25 * scale - income
+    carry = income + rolldown
     rates = -(x.duration_prev or 0.0) * (x.dy_bp or 0.0) / 1e4 * x.clean_prev * scale
     spread = -(x.spread_duration_prev or 0.0) * (x.ds_bp or 0.0) / 1e4 * x.clean_prev * scale
     price_total = (x.clean_now - x.clean_prev) * scale
-    optionality = price_total - rates - spread if (x.dy_bp is not None or x.ds_bp is not None) else 0.0
-    if x.dy_bp is None and x.ds_bp is None:
-        residual_price = price_total
-    else:
-        residual_price = 0.0
+    optionality = price_total - rolldown - rates - spread if (x.dy_bp is not None or x.ds_bp is not None) else 0.0
     local = {"carry": carry, "rates": rates, "spread": spread, "optionality": optionality}
     translated = {k: v * x.fx_now for k, v in local.items()}
     fx_pnl = (x.fx_now - x.fx_prev) * (x.clean_prev + x.accrued_prev) * scale
@@ -66,7 +67,7 @@ def attribute_instrument(x: AttributionInputs) -> dict[str, float]:
     translated["execution"] = -abs(x.execution_cost)
     translated["financing_fees"] = 0.0
     translated["model_change"] = x.model_change_pnl
-    total = total_local * x.fx_now + fx_pnl + x.default_recovery_pnl - abs(x.execution_cost) + x.model_change_pnl + residual_price * x.fx_now * 0.0
+    total = total_local * x.fx_now + fx_pnl + x.default_recovery_pnl - abs(x.execution_cost) + x.model_change_pnl
     translated["residual"] = total - sum(translated[k] for k in ORDER if k != "residual")
     translated["total"] = total
     return translated
@@ -118,4 +119,3 @@ def attribution_series(daily_reports: list[AttributionReport]) -> pd.DataFrame:
 
 
 __all__ = ["ORDER", "AttributionInputs", "AttributionReport", "attribute_instrument", "attribute_portfolio", "attribution_series"]
-_ = Callable

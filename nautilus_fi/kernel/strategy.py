@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 
 from nautilus_fi.domain.calendars import RebalanceCalendar, parse_calendar
-from nautilus_fi.domain.conventions import PROFILES, WeightDrift
+from nautilus_fi.domain.conventions import PROFILES, ExitPolicy, WeightDrift
 from nautilus_fi.kernel.benchmark import Benchmark, Index, as_benchmark
 from nautilus_fi.kernel.data import (
     ASSET,
@@ -71,7 +71,7 @@ from nautilus_fi.kernel.portfolio import (
 )
 
 KERNEL_VERSION = "1"
-OPTIONAL = ("alive", "xr", "tsy_r", "oad", "oasd", "dts", "oas_bp", "sector", "rating_score", "issuer", "half_spread_bp", "price_dirty", "price_clean", "min_piece", "cash")
+OPTIONAL = ("alive", "xr", "tsy_r", "oad", "oasd", "dts", "oas_bp", "sector", "rating_score", "issuer", "half_spread_bp", "price_dirty", "price_clean", "min_piece", "cash", "maturity", "call_date", "exit_date", "redemption_date")
 REPORT_EXPOSURES = ("oad", "oasd", "dts", "oas_bp")
 
 
@@ -212,7 +212,7 @@ class Requirements:
 
     def __str__(self) -> str:
         return (f"fields {sorted(self.fields)}; attributes {sorted(self.attributes)}; series {sorted(self.series)}; indices {sorted(self.indices)}"
-                f"{'; overlays ' + str(list(self.overlay_ids)) + ' ' + str(sorted(self.overlay_fields)) if self.overlay_ids else ''}; look-back {self.lookback} rows")
+                f"{'; overlays ' + str(list(self.overlay_ids)) + ' ' + str(sorted(self.overlay_fields)) if self.overlay_ids else ''}; look-back {'all history' if self.lookback >= 10 ** 9 else str(self.lookback) + ' rows'}")
 
 
 def _max_window(obj, depth: int = 0) -> int:
@@ -255,9 +255,15 @@ class Strategy:
     hypothesis: str | None = None
     profile: str = "kernel"
     notes: str = ""
+    exits: ExitPolicy = ExitPolicy.SELL                 # held names that leave the universe: SELL | EXCLUDE | HOLD_NOT_BUY
+    hold: str = "drift"                                 # between rebalances: "drift" with returns, or "constant" exposure (fi-lib-research)
 
     def __post_init__(self) -> None:
         set_ = object.__setattr__
+        set_(self, "exits", self.exits if isinstance(self.exits, ExitPolicy) else ExitPolicy(str(self.exits).upper()))
+        set_(self, "hold", str(self.hold).lower())
+        if self.hold not in ("drift", "constant"):
+            raise StrategyError(f"hold must be 'drift' (weights move with returns between rebalances) or 'constant' (the traded weights are held), not {self.hold!r}")
         if isinstance(self.signal, str):
             set_(self, "signal", Field(self.signal))
         if self.universe is not None and not isinstance(self.universe, Expr):
@@ -288,17 +294,30 @@ class Strategy:
             return self.with_(**{head: value})
         return self.with_(**{head: _replace_path(getattr(self, head), rest, value)})
 
-    def under(self, profile: str) -> Strategy:
-        """This strategy under a legacy framework's conventions (timing, missing returns, excess
-        returns, turnover, annualisation, benchmark drift); costs, universe and signal unchanged."""
+    def under(self, profile: str, refill: str | None = None) -> Strategy:
+        """This strategy under a legacy framework's conventions: execution timing, missing returns,
+        excess returns, turnover and annualisation, the benchmark weight drift (applied to every
+        ``Index`` in the benchmark, derived or blended ones included), and zero-cash when the profile
+        says cash earns nothing. The schedule, costs, universe, signal and portfolio stay as they are:
+        rebalancing is a strategy choice, not a convention. A profile that refills bad dates needs the
+        refill field: ``refill=`` (else the strategy's own ``Refill`` field, if it has one)."""
+        from nautilus_fi.domain.conventions import CashReturn
+        from nautilus_fi.kernel.mechanics import NoCash
+
         conv = PROFILES.get(profile)
         if conv is None:
             raise KeyError(f"unknown conventions profile {profile!r}; known: {sorted(PROFILES)}")
         m = mechanics_from_conventions(conv)
-        bench = self.benchmark
-        if isinstance(bench, Index):
-            bench = Index(bench.name, m["benchmark_drift"], bench.weight_field)
-        return self.with_(execution=dataclasses.replace(self.execution, lag=m["execution_lag"]), missing=m["missing"], metrics=m["metrics"], benchmark=bench, profile=profile, name=f"{self.name}[{profile}]")
+        missing = m["missing"]
+        if missing.policy.value == "REFILL":
+            field_ = refill or self.missing.refill
+            if field_ is None:
+                raise StrategyError(f"the {profile!r} profile refills bad dates from another field: under({profile!r}, refill='<field>')")
+            missing = dataclasses.replace(missing, refill=field_)
+        financing = self.financing
+        if conv.cash_return == CashReturn.ZERO and financing.series is not None:
+            financing = NoCash(financing.borrow_spread_bp, financing.short_fee_bp)
+        return self.with_(execution=dataclasses.replace(self.execution, lag=m["execution_lag"]), missing=missing, metrics=m["metrics"], benchmark=with_drift(self.benchmark, m["benchmark_drift"]), financing=financing, profile=profile, name=f"{self.name}[{profile}]")
 
     @classmethod
     def from_spec(cls, spec, name: str | None = None) -> Strategy:
@@ -307,7 +326,7 @@ class Strategy:
 
         conv = spec.conventions
         m = mechanics_from_conventions(conv)
-        return cls(name or spec.name, portfolio=spec.construction, schedule=spec.rebalance, execution=NextClose(conv.timing.trade_offset_days), missing=MR(conv.missing_returns, conv.bad_date_threshold), metrics=m["metrics"], decider=spec.decider, universe_rule=spec.universe, hypothesis=spec.hypothesis_id, profile=conv.name)
+        return cls(name or spec.name, portfolio=spec.construction, schedule=spec.rebalance, execution=Execution(conv.timing.trade_offset_days), missing=MR(conv.missing_returns, conv.bad_date_threshold), metrics=m["metrics"], decider=spec.decider, universe_rule=spec.universe, hypothesis=spec.hypothesis_id, profile=conv.name)
 
     # ------------------------------------------------------------------ resolution
     def resolved(self) -> Strategy:
@@ -383,6 +402,8 @@ class Strategy:
     def describe(self) -> str:
         s = self.resolved()
         rows = [("universe", s.universe), ("signal", s.signal), ("portfolio", s.portfolio), ("benchmark", s.benchmark), ("schedule", f"{s.schedule} ({_calendar_prose(s.schedule)})"), ("execution", f"{s.execution!r}: {s.execution.describe()}"), ("financing", s.financing), ("missing", s.missing), ("metrics", f"{s.metrics!r}: annualisation {s.metrics.annualisation.value}, turnover {s.metrics.turnover.value}, excess {s.metrics.excess!r}"), ("overlay", s.overlay), ("capital", f"{s.capital:,.0f}"), ("returns", s.returns)]
+        if s.hold != "drift":
+            rows.append(("hold", f"{s.hold}: the traded weights are held between rebalances (the implicit daily rebalance is not charged)"))
         if s.decider is not None:
             rows.insert(1, ("decider", f"{type(s.decider).__name__}({', '.join(f'{k}={v!r}' for k, v in s.decider.params().items())})"))
         lines = [f"Strategy {self.name!r}  [fingerprint {self.fingerprint}{', hypothesis ' + self.hypothesis if self.hypothesis else ''}{', profile ' + self.profile if self.profile != 'kernel' else ''}]"]
@@ -393,6 +414,59 @@ class Strategy:
 
     def __repr__(self) -> str:
         return f"Strategy({self.name!r}, fingerprint={self.fingerprint})"
+
+    # ------------------------------------------------------------------ saved configs
+    def to_code(self) -> str:
+        """The strategy as Python source over the kernel's names, which ``from_code`` rebuilds to
+        the same fingerprint. Custom code (``apply`` / ``cs`` functions, deciders) cannot be saved
+        this way: it raises, naming the part."""
+        for name in ("universe", "signal", "benchmark"):
+            v = getattr(self, name)
+            if isinstance(v, Expr) and v.callables():
+                raise StrategyError(f"the {name} holds custom code ({[c.get('name') for c in v.callables()]}): save the source file instead")
+        if self.decider is not None or self.universe_rule is not None:
+            raise StrategyError("a decider or legacy universe rule is custom code: save the source file instead")
+        parts = [f"name={self.name!r}"]
+        for f in ("universe", "signal", "portfolio", "benchmark", "overlay"):
+            v = getattr(self, f)
+            if v is not None:
+                parts.append(f"{f}={v!r}")
+        parts += [f"schedule={self.schedule!r}", f"execution={self.execution!r}", f"financing={self.financing!r}", f"missing={self.missing!r}", f"metrics={self.metrics!r}", f"capital={self.capital!r}", f"returns={self.returns!r}", f"exits={self.exits.value!r}"]
+        for f in ("fields", "lookback", "hypothesis", "profile", "notes", "hold"):
+            v = getattr(self, f)
+            default = {"fields": (), "lookback": 0, "hypothesis": None, "profile": "kernel", "notes": "", "hold": "drift"}[f]
+            if v != default:
+                parts.append(f"{f}={v!r}")
+        return "Strategy(" + ", ".join(parts) + ")"
+
+    @classmethod
+    def from_code(cls, code: str, fingerprint: str | None = None) -> Strategy:
+        """Rebuild a strategy from ``to_code`` source (evaluated over the kernel's names only);
+        ``fingerprint``: the one it must reproduce (a config saved with its fingerprint)."""
+        from nautilus_fi import kernel
+
+        ns = {k: getattr(kernel, k) for k in kernel.__all__}
+        ns.update({"np": np, "pd": pd, "inf": float("inf"), "nan": float("nan")})
+        s = eval(code, {"__builtins__": {"True": True, "False": False, "None": None, "float": float, "int": int, "dict": dict, "list": list, "tuple": tuple}}, ns)
+        if fingerprint is not None and s.fingerprint != fingerprint:
+            raise StrategyError(f"the restored strategy's fingerprint {s.fingerprint} is not the saved {fingerprint}: a component's text does not rebuild it exactly")
+        return s
+
+    def save(self, path) -> None:
+        """Save as a JSON config: the code, its fingerprint and the kernel version."""
+        from pathlib import Path
+
+        from nautilus_fi.core.fileio import atomic_write_text
+        from nautilus_fi.version import __version__
+
+        atomic_write_text(Path(path), json.dumps({"code": self.to_code(), "fingerprint": self.fingerprint, "kernel_version": __version__}, indent=2))
+
+    @classmethod
+    def load(cls, path) -> Strategy:
+        from pathlib import Path
+
+        d = json.loads(Path(path).read_text())
+        return cls.from_code(d["code"], d.get("fingerprint"))
 
     # ------------------------------------------------------------------ data
     def expressions(self) -> list[Expr]:
@@ -416,9 +490,14 @@ class Strategy:
         names |= s.portfolio.names() | s.execution.names() | s.missing.names() | set(s.fields)
         names |= legacy_names(s.decider, s.universe_rule, getattr(s.portfolio, "spec", None))
         lookback = max(lookback, int(s.lookback))
-        names.add(s.returns)
-        if s.financing.series:
-            names.add(s.financing.series)
+        if isinstance(s.returns, Expr):                    # returns from an expression: its inputs, unlagged history
+            names |= s.returns.names()
+            lookback = max(lookback, s.returns.lookback())
+        else:
+            names.add(s.returns)
+        if getattr(s.schedule, "triggered", False) and getattr(s.schedule, "field", None):
+            names.add(s.schedule.field)
+        names |= s.financing.names()
         if s.metrics.risk_free:
             names.add(s.metrics.risk_free)
         optional = set(OPTIONAL) | s.metrics.names() | set(REPORT_EXPOSURES) | s.execution.optional_names()
@@ -428,7 +507,7 @@ class Strategy:
         req = Requirements(indices=indices, lookback=lookback)
         if s.overlay is not None:
             req.overlay_ids = tuple(s.overlay.instruments)
-            req.overlay_fields = {s.returns, *s.overlay.fields}
+            req.overlay_fields = {s.returns if isinstance(s.returns, str) else "tr", *s.overlay.fields}
         if catalog is None:
             req.fields = names
             return req
@@ -489,9 +568,8 @@ class Strategy:
 
     def conventions(self):
         s = self.resolved()
-        drift = s.benchmark.drift if isinstance(s.benchmark, Index) else WeightDrift.DRIFT
         prof = PROFILES.get(self.profile)
-        return conventions_of(s.execution, s.missing, s.metrics, s.schedule, drift, s.financing, self.profile, prof.confirmed if prof is not None else True)
+        return conventions_of(s.execution, s.missing, s.metrics, s.schedule, benchmark_drift(s.benchmark), s.financing, self.profile, prof.confirmed if prof is not None else True, s.exits)
 
 
 def legacy_names(decider=None, rule=None, construction=None) -> set[str]:
@@ -524,6 +602,45 @@ def legacy_names(decider=None, rule=None, construction=None) -> set[str]:
         if getattr(construction, "overlay", None) is not None:
             out |= set(construction.overlay.fields)
     return out
+
+
+def benchmark_drift(benchmark) -> WeightDrift:
+    """The weight drift of the indices a benchmark is built from (derived and blended ones
+    included; the most common when they differ; DRIFT without any)."""
+    from collections import Counter
+
+    found: list = []
+
+    def walk(b):
+        if isinstance(b, Index):
+            found.append(b.drift)
+        for c in getattr(b, "_children", ()) or ():
+            if isinstance(c, Benchmark):
+                walk(c)
+
+    if benchmark is not None:
+        walk(benchmark)
+    return Counter(found).most_common(1)[0][0] if found else WeightDrift.DRIFT
+
+
+def with_drift(benchmark, drift):
+    """``benchmark`` with every ``Index`` in it rebuilt with ``drift`` (filters, caps, reweighting and
+    blends kept)."""
+    from nautilus_fi.kernel.benchmark import Blend, Capped, Filtered, Reweighted
+
+    if benchmark is None:
+        return None
+    if isinstance(benchmark, Index):
+        return Index(benchmark.name, drift, benchmark.weight_field)
+    if isinstance(benchmark, Filtered):
+        return Filtered(with_drift(benchmark.parent, drift), benchmark.predicate, benchmark.negate, benchmark.label)
+    if isinstance(benchmark, Capped):
+        return Capped(with_drift(benchmark.parent, drift), benchmark.by, benchmark.cap_)
+    if isinstance(benchmark, Reweighted):
+        return Reweighted(with_drift(benchmark.parent, drift), benchmark.how)
+    if isinstance(benchmark, Blend):
+        return Blend(*[(with_drift(b, drift), w) for b, w in benchmark.components], rebalance=benchmark.rebalance)
+    return benchmark                                    # a return series has no weights to drift
 
 
 def _short(v) -> str:

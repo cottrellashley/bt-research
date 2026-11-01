@@ -98,7 +98,7 @@ def event_engine_overlays() -> None:
                 targets["TYM3"] = -0.3
             self.rebalance_overlays(targets)
 
-    res = FixedIncomeBacktest(env, Book(FixedIncomeStrategyConfig(rebalance="M")), NET_SPREAD, settings=BacktestSettings(starting_cash=100e6, margin=MarginSettings(collateral=1e6, book=book, synthetic_shorts={corp[5]}))).run()
+    res = FixedIncomeBacktest(env, Book(FixedIncomeStrategyConfig(rebalance="BMS")), NET_SPREAD, settings=BacktestSettings(starting_cash=100e6, margin=MarginSettings(collateral=1e6, book=book, synthetic_shorts={corp[5]}))).run()
     nav = res.nav
     pos = res.positions_report
     print(f"event engine: {res.status}/{res.outcome}; NAV {nav['nav'].iloc[-1]:,.0f}; margin equity {nav['margin_equity'].iloc[-1]:,.0f} vs initial margin {nav['margin_required'].iloc[-1]:,.0f}; collateral transfers {len(res.extra['margin_transfers'])}; borrow fees {res.extra['borrow_fees']['fee'].sum() if len(res.extra['borrow_fees']) else 0:,.2f}")

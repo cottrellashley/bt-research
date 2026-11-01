@@ -48,9 +48,15 @@ class Annualisation(str, Enum):
 
 class MissingReturnPolicy(str, Enum):
     ZERO = "ZERO"                  # a missing return on a held asset is a zero return
-    DROP_DATE = "DROP_DATE"        # bad dates are removed for every asset
+    DROP_DATE = "DROP_DATE"        # bad dates leave the run (portfolio, benchmark and statistics); other gaps are zero-filled and counted
     REFILL = "REFILL"              # missing values are taken from a refill source; FAIL if still missing
     FAIL = "FAIL"                  # any missing return on a held asset stops the run
+
+
+class ExitPolicy(str, Enum):
+    SELL = "SELL"                  # a held name that leaves the universe is sold at the next rebalance, outside any turnover budget
+    EXCLUDE = "EXCLUDE"            # it may only shrink; selling it comes first within the turnover budget
+    HOLD_NOT_BUY = "HOLD_NOT_BUY"  # it may be held (or trimmed) but never bought
 
 
 class CashReturn(str, Enum):
@@ -89,8 +95,10 @@ class Conventions:
     annualisation: Annualisation = Annualisation.CALENDAR_365
     missing_returns: MissingReturnPolicy = MissingReturnPolicy.FAIL
     bad_date_threshold: float = 0.5                      # share of a cross-section missing or exactly zero
+    bad_date_zeros_only: bool = False                    # count only exactly-zero returns as bad (missing ones are gaps, not a bad date)
     rebalance: str = "BME"
     cash_return: CashReturn = CashReturn.OVERNIGHT
+    exits: ExitPolicy = ExitPolicy.SELL                  # held names that leave the universe
     confirmed: bool = True
     notes: str = ""
 
@@ -118,7 +126,7 @@ class Conventions:
     def describe(self) -> str:
         return (f"{self.name}: lag {self.timing.return_lag_days}d, excess {self.excess_return.value}{' (vendor first)' if self.prefer_vendor_excess else ''}, "
                 f"benchmark {self.benchmark_drift.value}, turnover {self.turnover.value}, annualisation {self.annualisation.value}, "
-                f"missing {self.missing_returns.value}, rebalance {self.rebalance}, cash {self.cash_return.value}")
+                f"missing {self.missing_returns.value}, rebalance {self.rebalance}, cash {self.cash_return.value}, exits {self.exits.value}")
 
     # ------------------------------------------------------------------ statistics
     def years(self, index: pd.Index) -> float:
@@ -134,10 +142,27 @@ PROFILES: dict[str, Conventions] = {
     "fi_lib_research": Conventions(name="fi_lib_research", timing=Timing(2), confirmed=False, notes="trades T+1, first earns T+2; excess-return formula unreadable in the review, confirm"),
     "EUR_IG": Conventions(name="EUR_IG", timing=Timing(2), confirmed=False, notes="EUR IG LightGBM: trades T+1, first earns T+2"),
     "MRI_v1": Conventions(name="MRI_v1", timing=Timing(1), excess_return=ExcessReturnMethod.DAILY_SUM, prefer_vendor_excess=False, missing_returns=MissingReturnPolicy.ZERO, confirmed=False, notes="earns close T -> T+1 on the close its signal sees; sums daily excess returns"),
-    "erin_beta_plus": Conventions(name="erin_beta_plus", timing=Timing(1), benchmark_drift=WeightDrift.STATIC, turnover=TurnoverDefinition.ONE_WAY_BUYS, missing_returns=MissingReturnPolicy.REFILL, confirmed=False, notes="T-1 inputs earn the T return; benchmark weights never drift; one-way buys turnover; bad dates refilled"),
+    "erin_beta_plus": Conventions(name="erin_beta_plus", timing=Timing(1), benchmark_drift=WeightDrift.STATIC, turnover=TurnoverDefinition.ONE_WAY_BUYS, missing_returns=MissingReturnPolicy.REFILL, bad_date_threshold=0.8, bad_date_zeros_only=True, confirmed=False, notes="T-1 inputs earn the T return; published daily benchmark weights, never drifted; one-way buys turnover; dates with >= 80% exactly-zero returns refilled (Erin refills from the next orphan date within 4 days: name the refill field)"),
     "fi_lib_backtesting": Conventions(name="fi_lib_backtesting", benchmark_drift=WeightDrift.DRIFT, turnover=TurnoverDefinition.TWO_WAY, missing_returns=MissingReturnPolicy.ZERO, confirmed=False, notes="benchmark weights drift between reconstitutions; round-trip turnover"),
     "paperport": Conventions(name="paperport", annualisation=Annualisation.TRADING_252, missing_returns=MissingReturnPolicy.ZERO, confirmed=False, notes="252 periods / sqrt(252); turnover definition unreadable in the review, confirm"),
 }
+
+
+_SIGNATURE = ("timing", "excess_return", "prefer_vendor_excess", "benchmark_drift", "turnover", "annualisation", "missing_returns", "bad_date_threshold", "bad_date_zeros_only", "cash_return")
+
+
+def unconfirmed_profile(conv: Conventions) -> str | None:
+    """The unconfirmed legacy profile whose distinguishing conventions (where it differs from the
+    canonical profile) ``conv`` carries, whatever ``conv`` is called. Confirmation belongs to the
+    resolved values, so relabelling a legacy profile's mechanics does not confirm them."""
+    base = PROFILES["canonical"]
+    for name, prof in PROFILES.items():
+        if prof.confirmed:
+            continue
+        diff = [f for f in _SIGNATURE if getattr(prof, f) != getattr(base, f)]
+        if diff and all(getattr(conv, f) == getattr(prof, f) for f in diff):
+            return name
+    return None
 
 
 # ====================================================================================== statistics
@@ -276,11 +301,51 @@ def compound_excess(total: pd.Series | np.ndarray, treasury: pd.Series | np.ndar
     return float((np.prod(1.0 + tr) - 1.0) - (np.prod(1.0 + ts) - 1.0))
 
 
+def excess_method(method: ExcessReturnMethod, prefer_vendor: bool, has_vendor: bool) -> ExcessReturnMethod:
+    """The method that applies: vendor excess returns replace the computed ones when supplied and
+    preferred (never under ``DAILY_SUM``, which reproduces frameworks that sum their own)."""
+    if has_vendor and prefer_vendor and method != ExcessReturnMethod.DAILY_SUM:
+        return ExcessReturnMethod.VENDOR
+    return method
+
+
+def annualised_excess(total, treasury, method: ExcessReturnMethod, years: float, vendor_excess=None, prefer_vendor: bool = True) -> float:
+    """Annual excess return over ``years`` from per-period legs, under the convention:
+
+    * ``VENDOR``: the compounded vendor excess series, annualised;
+    * ``COMPOUNDED``: each leg compounded and annualised, then differenced (``g_tr ** (1/y) - g_tsy ** (1/y)``);
+    * ``GEOMETRIC``: the annualised ratio of the compounded legs;
+    * ``DAILY_SUM``: the summed per-period differences, per year (legacy).
+
+    Every engine's statistics call this, so a reported excess return never compounds per-period
+    differences (which is none of the four)."""
+    if not years or not np.isfinite(years) or years <= 0:
+        return float("nan")
+    method = excess_method(method, prefer_vendor, vendor_excess is not None)
+    if method == ExcessReturnMethod.VENDOR:
+        if vendor_excess is None:
+            raise ValueError("VENDOR excess return method needs the vendor excess series")
+        g = float(np.prod(1.0 + np.asarray(vendor_excess, dtype=float)))
+        return g ** (1.0 / years) - 1.0 if g > 0 else float("nan")
+    if treasury is None:
+        if method == ExcessReturnMethod.DAILY_SUM and vendor_excess is not None:
+            return float(np.sum(np.asarray(vendor_excess, dtype=float)) / years)
+        raise ValueError(f"{method.value} excess return needs the Treasury return series")
+    tr, ts = np.asarray(total, dtype=float), np.asarray(treasury, dtype=float)
+    if method == ExcessReturnMethod.DAILY_SUM:
+        return float(np.sum(tr - ts) / years)
+    gt, gs = float(np.prod(1.0 + tr)), float(np.prod(1.0 + ts))
+    if gt <= 0 or gs <= 0:
+        return float("nan")
+    if method == ExcessReturnMethod.GEOMETRIC:
+        return (gt / gs) ** (1.0 / years) - 1.0
+    return gt ** (1.0 / years) - gs ** (1.0 / years)
+
+
 def excess_return_series(total: pd.Series, treasury: pd.Series | None, conventions: Conventions, freq: str | None = None, vendor_excess: pd.Series | None = None) -> pd.Series:
-    """Per-period excess returns, optionally aggregated to ``freq`` (e.g. "ME") under the convention."""
-    method = conventions.excess_return
-    if vendor_excess is not None and conventions.prefer_vendor_excess and method != ExcessReturnMethod.DAILY_SUM:
-        method = ExcessReturnMethod.VENDOR
+    """Per-period excess returns, optionally aggregated to ``freq`` (e.g. "ME") under the convention
+    (each period's legs compounded separately: ``compound_excess``)."""
+    method = excess_method(conventions.excess_return, conventions.prefer_vendor_excess, vendor_excess is not None)
     total = pd.Series(total).astype(float)
     tsy = pd.Series(treasury).reindex(total.index).astype(float) if treasury is not None else None
     ven = pd.Series(vendor_excess).reindex(total.index).astype(float) if vendor_excess is not None else None
@@ -319,13 +384,14 @@ class MissingReturnsError(ValueError):
     pass
 
 
-def detect_bad_dates(returns: pd.DataFrame, threshold: float = 0.5, alive: pd.DataFrame | None = None) -> list:
+def detect_bad_dates(returns: pd.DataFrame, threshold: float = 0.5, alive: pd.DataFrame | None = None, zeros_only: bool = False) -> list:
     """Dates where at least ``threshold`` of the live cross-section is missing or exactly zero
-    (vendor holiday mismatches, stale snapshots)."""
+    (vendor holiday mismatches, stale snapshots); ``zeros_only``: exactly-zero returns only."""
     if returns.empty:
         return []
     live = alive.reindex_like(returns).fillna(False).astype(bool) if alive is not None else pd.DataFrame(True, index=returns.index, columns=returns.columns)
-    bad_share = ((returns.isna() | (returns == 0.0)) & live).sum(axis=1) / live.sum(axis=1).replace(0, np.nan)
+    flagged = (returns == 0.0) if zeros_only else (returns.isna() | (returns == 0.0))
+    bad_share = (flagged & live).sum(axis=1) / live.sum(axis=1).replace(0, np.nan)
     return [d for d, s in bad_share.items() if s >= threshold and live.loc[d].sum() > 1]
 
 
@@ -377,22 +443,26 @@ __all__ = [
     "CashReturn",
     "Conventions",
     "ExcessReturnMethod",
+    "ExitPolicy",
     "MissingReturnPolicy",
     "MissingReturnReport",
     "MissingReturnsError",
     "Timing",
     "TurnoverDefinition",
     "WeightDrift",
+    "annualised_excess",
     "annualised_return",
     "annualised_vol",
     "apply_missing_policy",
     "compound_excess",
     "detect_bad_dates",
+    "excess_method",
     "excess_return_series",
     "performance_stats",
     "periods_per_year",
     "sharpe_ratio",
     "turnover",
     "turnover_all",
+    "unconfirmed_profile",
     "years_spanned",
 ]

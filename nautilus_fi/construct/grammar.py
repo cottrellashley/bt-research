@@ -34,7 +34,7 @@ from dataclasses import asdict, dataclass
 import numpy as np
 import pandas as pd
 
-KINDS = ("budget", "cash", "weight", "active_weight", "group", "active_group", "exposure", "active_exposure", "turnover", "leverage", "cardinality", "min_holding", "cvar")
+KINDS = ("budget", "cash", "weight", "active_weight", "group", "active_group", "exposure", "active_exposure", "turnover", "leverage", "cardinality", "min_holding", "min_trade", "cvar")
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,8 @@ class ConstraintSpec:
     hard: bool = True
     penalty: float = 100.0
     name: str = ""
+    strict: bool = False                     # never relaxed (a mandate limit), whatever the relaxation ladder does
+    min_benchmark_weight: float | None = None  # group constraints: skip groups the benchmark holds less of than this
 
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
@@ -93,6 +95,14 @@ def _groups(data: pd.DataFrame, attribute: str) -> pd.Series:
     return data[attribute].astype(str)
 
 
+def cash_floor(c: ConstraintSpec, levered: bool) -> float | None:
+    """The lower bound of a cash band: as given, else 0 (no borrowing) unless an explicit budget or
+    leverage constraint allows investing more than NAV."""
+    if c.min is not None:
+        return c.min
+    return None if levered else 0.0
+
+
 def check_constraints(weights: pd.Series, cs, constraints: list[ConstraintSpec], tol: float = 1e-6) -> list[dict]:
     """Violations of ``constraints`` by ``weights`` on the cross-section ``cs`` (any method)."""
     w = weights.reindex(cs.ids).fillna(0.0)
@@ -108,12 +118,13 @@ def check_constraints(weights: pd.Series, cs, constraints: list[ConstraintSpec],
         if lo is not None and value < lo - tol:
             out.append({"constraint": c.label, "group": group, "value": float(value), "bound": float(lo), "side": "min", "severity": "HARD" if c.hard else "SOFT"})
 
+    levered = any(c.kind in ("budget", "leverage") for c in constraints)
     for c in constraints:
         k = c.kind
         if k == "budget":
             chk(c, float(w.sum()))
         elif k == "cash":
-            chk(c, float(1.0 - w.sum()))
+            chk(c, float(1.0 - w.sum()), lo=cash_floor(c, levered))
         elif k in ("weight", "active_weight"):
             v = w - wb if k == "active_weight" else w
             for sym in v.index[(v > (c.max if c.max is not None else np.inf) + tol) | (v < (c.min if c.min is not None else -np.inf) - tol)]:
@@ -121,15 +132,21 @@ def check_constraints(weights: pd.Series, cs, constraints: list[ConstraintSpec],
         elif k in ("group", "active_group"):
             g = _groups(cs.data, c.attribute)
             sums = (w - wb if k == "active_group" else w).groupby(g).sum()
+            bsum = wb.groupby(g).sum()
             for grp, v in sums.items():
+                if c.min_benchmark_weight is not None and float(bsum.get(grp, 0.0)) < c.min_benchmark_weight:
+                    continue
                 if c.value is None or str(grp) == str(c.value):
                     chk(c, float(v), str(grp))
         elif k in ("exposure", "active_exposure"):
             x = cs.data[c.attribute].reindex(cs.ids).astype(float).fillna(0.0)
             a = (w - wb) if k == "active_exposure" else w
             keys = cs.data[c.group_by].astype(str) if c.group_by else pd.Series("ALL", index=cs.ids)
+            ovd, ovt = getattr(cs, "overlay_data", None), getattr(cs, "overlay_target", None)
             for grp, idx in keys.groupby(keys).groups.items():
                 val = float((a[idx] * x[idx]).sum())
+                if grp == "ALL" and ovd is not None and ovt is not None and c.attribute in ovd.columns:
+                    val += float(np.nan_to_num(ovd[c.attribute].to_numpy(dtype=float)) @ np.asarray(ovt, dtype=float))   # a joint hedge's exposure
                 if k == "active_exposure" and c.relative:
                     bexp = float((wb[idx] * x[idx]).sum())
                     lo = None if c.min is None else c.min * abs(bexp)
@@ -145,6 +162,11 @@ def check_constraints(weights: pd.Series, cs, constraints: list[ConstraintSpec],
             chk(c, float(w.abs().sum()))
         elif k == "cardinality":
             chk(c, float((w.abs() > 1e-9).sum()))
+        elif k == "min_trade" and c.min is not None:
+            dw = (w - w0).abs()
+            closing = (w.abs() < 1e-9) & (w0.abs() < c.min)
+            for sym in dw.index[(dw > 1e-9) & (dw < c.min - tol) & ~closing]:
+                out.append({"constraint": c.label, "group": sym, "value": float(dw[sym]), "bound": float(c.min), "side": "min", "severity": "HARD" if c.hard else "SOFT"})
         elif k == "min_holding":
             m = pd.Series(c.min, index=cs.ids) if c.min is not None else (cs.min_weight.reindex(cs.ids).fillna(0.0) if cs.min_weight is not None else pd.Series(0.0, index=cs.ids))
             bad = (w.abs() > 1e-9) & (w.abs() < m - tol)
@@ -159,4 +181,4 @@ def check_constraints(weights: pd.Series, cs, constraints: list[ConstraintSpec],
     return out
 
 
-__all__ = ["KINDS", "ConstraintSpec", "check_constraints", "parse_constraints"]
+__all__ = ["KINDS", "ConstraintSpec", "cash_floor", "check_constraints", "parse_constraints"]

@@ -41,6 +41,7 @@ class EvaluationSettings:
     min_names: int = 20
     n_boot: int = 1000
     seed: int = 0
+    missing: str = "exclude"                      # a forward window with a missing return while the bond exists: exclude it | zero (legacy)
 
 
 @dataclass
@@ -89,6 +90,22 @@ def _forward_growth(r: np.ndarray) -> np.ndarray:
     return np.vstack([np.zeros(r.shape[1]), np.cumsum(lg, axis=0)])
 
 
+def _gaps_and_exits(r: np.ndarray, alive: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+    """Cumulative counts (rows + 1 x names) of missing returns while a bond exists (gaps) and of
+    rows after it stops existing (exits), so a forward window can be excluded or flagged."""
+    fin = np.isfinite(r)
+    if alive is None:                              # existence from the first to the last finite return
+        T = r.shape[0]
+        first = np.where(fin.any(axis=0), fin.argmax(axis=0), T)
+        last = np.where(fin.any(axis=0), T - 1 - fin[::-1].argmax(axis=0), -1)
+        tt = np.arange(T)[:, None]
+        alive = (tt >= first[None, :]) & (tt <= last[None, :])
+    gap = alive & ~fin
+    gone = ~alive
+    z = np.zeros((1, r.shape[1]), dtype=np.int64)
+    return np.vstack([z, np.cumsum(gap, axis=0)]), np.vstack([z, np.cumsum(gone, axis=0)])
+
+
 def evaluate_signal(panel: Panel, signal: str | pd.DataFrame, conventions: Conventions | None = None, settings: EvaluationSettings | None = None, attributes: pd.DataFrame | None = None, ledger=None, hypothesis_id: str | None = None, name: str | None = None) -> EvaluationReport:
     conventions = conventions or Conventions()
     st = settings or EvaluationSettings()
@@ -99,6 +116,8 @@ def evaluate_signal(panel: Panel, signal: str | pd.DataFrame, conventions: Conve
     R = panel[st.return_field].astype(np.float64)
     G = _forward_growth(R)                        # G[k] = growth through row k-1
     alive = panel["alive"] > 0 if "alive" in panel else np.isfinite(R)
+    GAP, EXIT = _gaps_and_exits(R, (panel["alive"] > 0) if "alive" in panel else None)
+    excluded, exits = {}, {}
     off = conventions.timing.trade_offset_days
     eval_idx = np.nonzero(np.isin(dates.date, parse_calendar(st.calendar).dates(list(dates.date), first_decision=False)))[0]
     uni = panel[st.universe_field] if st.universe_field and st.universe_field in panel else None
@@ -137,20 +156,29 @@ def evaluate_signal(panel: Panel, signal: str | pd.DataFrame, conventions: Conve
             if b >= T:
                 continue
             fwd = pd.Series(np.expm1(G[b + 1][mask] - G[a + 1][mask]), index=s_m.index)
-            ic[d][h] = float(s_m.corr(fwd, method="spearman"))
+            gapped = (GAP[b + 1][mask] - GAP[a + 1][mask]) > 0
+            exited = (EXIT[b + 1][mask] - EXIT[a + 1][mask]) > 0
+            exits[(d, h)] = int(exited.sum())       # redeemed inside the window: the rest of it earns cash (zero)
+            if st.missing == "exclude" and gapped.any():
+                excluded[(d, h)] = int(gapped.sum())
+                fwd = fwd[~gapped]
+            ic[d][h] = float(s_m.reindex(fwd.index).corr(fwd, method="spearman"))
             if s_n is not None:
-                icn[d][h] = float(s_n.corr(fwd, method="spearman"))
+                icn[d][h] = float(s_n.reindex(fwd.index).corr(fwd, method="spearman"))
+            qh = q.reindex(fwd.index)
             if W is not None:
-                wv = pd.Series(W[i][mask], index=s_m.index)
-                qm = (fwd * wv).groupby(q).sum() / wv.groupby(q).sum()
+                wv = pd.Series(W[i][mask], index=s_m.index).reindex(fwd.index)
+                qm = (fwd * wv).groupby(qh).sum() / wv.groupby(qh).sum()
             else:
-                qm = fwd.groupby(q).mean()
+                qm = fwd.groupby(qh).mean()
             qrows.append({"date": d, "horizon": h, **{f"Q{k}": float(v) for k, v in qm.items()}})
             sprd[d][h] = float(qm.get(st.n_quantiles, np.nan) - qm.get(1, np.nan))
     ic_df = pd.DataFrame.from_dict(ic, orient="index").sort_index()
     sp_df = pd.DataFrame.from_dict(sprd, orient="index").sort_index()
     qdf = pd.DataFrame(qrows).set_index(["date", "horizon"]).sort_index() if qrows else pd.DataFrame()
     rep = EvaluationReport(name or (signal if isinstance(signal, str) else "signal"), conventions, st, ic_df, pd.DataFrame.from_dict(icn, orient="index").sort_index() if (st.neutralise_groups or st.neutralise_exposures) else None, qdf, sp_df, pd.Series(cover, name="n_names"), pd.Series(topt, name="top_turnover"))
+    rep.excluded = pd.Series(excluded, dtype=int, name="excluded_missing")
+    rep.exits = pd.Series(exits, dtype=int, name="exited_in_window")
     if ledger is not None:
         ledger.record_evaluation(rep, hypothesis_id)
     return rep

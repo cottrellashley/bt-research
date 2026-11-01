@@ -34,7 +34,7 @@ from nautilus_fi.propose import (
     reconcile_positions,
     write_orders,
     write_port_upload,
-    write_prep_report,
+    write_pretrade_report,
 )
 from nautilus_fi.synthetic.panels import SyntheticPanelConfig, generate_synthetic_panel
 
@@ -55,12 +55,14 @@ def test_proposal_prices_validates_and_writes(tmp_path):
     assert buy["settle_date"] == date(2024, 6, 4)                                  # US corporates settle T+1 after 28 May 2024
     checks = set(prop.validation["check"])
     assert {"restricted_list", "constraint:group:sector", "stale_price"} <= checks and not prop.ok
-    crd = write_orders(prop, tmp_path / "crd.csv")
-    qoe = write_orders(prop, tmp_path / "qoe.csv", QOE_ORDERS)
+    with pytest.raises(ValueError, match="blockers"):
+        write_orders(prop, tmp_path / "blocked.csv")                               # a blocked proposal is not written by default
+    crd = write_orders(prop, tmp_path / "crd.csv", blocked_ok=True)
+    qoe = write_orders(prop, tmp_path / "qoe.csv", QOE_ORDERS, blocked_ok=True)
     assert pd.read_csv(crd)["TRANS_TYPE"].isin(["BUYL", "SELLL"]).all() and pd.read_csv(qoe)["Side"].isin(["B", "S"]).all()
     port = write_port_upload(prop, tmp_path / "port.csv", bonds)
-    write_prep_report(prop, tmp_path / "prep.csv")
-    assert (tmp_path / "prep.md").exists()
+    write_pretrade_report(prop, tmp_path / "pretrade.csv")
+    assert (tmp_path / "pretrade.md").exists()
     back = read_positions(port, symbol_map={b.identifiers.cusip: s for s, b in bonds.items()})
     rec = reconcile_positions(prop.holdings_after.set_index("symbol")["face"], back)
     assert (rec["status"] == "MATCH").all()

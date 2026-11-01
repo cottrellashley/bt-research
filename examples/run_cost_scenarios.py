@@ -29,7 +29,7 @@ def main() -> None:
     env = market.build_environment(analytics=AnalyticsConfig(every_n_days=1))
 
     def make_strategy():
-        return CarryValueStrategy(CarryValueConfig(strategy_id=StrategyId("CARRY-001"), rebalance="M", n_long=10))
+        return CarryValueStrategy(CarryValueConfig(strategy_id=StrategyId("CARRY-001"), rebalance="BMS", n_long=10))
 
     with pd.option_context("display.width", 200, "display.max_columns", None):
         print("=== cost stress ===")

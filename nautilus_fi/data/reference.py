@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from datetime import date
 
 import pandas as pd
@@ -64,9 +65,27 @@ def _frequency(v) -> Frequency:
     return Frequency(int(v))
 
 
+REFERENCE_DEFAULTS = {"min_piece": 2_000.0, "increment": 1_000.0}
+
+
+def _number(v) -> float | None:
+    """A reference number, or None when missing (empty, None or NaN: NaN must not disable a check)."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    f = float(v)
+    return None if pd.isna(f) else f
+
+
 def bond_from_row(row: pd.Series | dict) -> BondSpec:
+    """A ``BondSpec`` from one reference row. A missing minimum piece or increment takes
+    ``REFERENCE_DEFAULTS`` and is recorded in ``spec.tags["reference_defaults"]`` (and warned about
+    by ``reference_from_dataframe``): trading rules should come from governed reference data."""
     r = dict(row)
     g = r.get
+    mp, inc = _number(g("min_piece")), _number(g("increment"))
+    defaulted = [k for k, v in (("min_piece", mp), ("increment", inc)) if v is None]
+    if (mp is not None and mp <= 0) or (inc is not None and inc <= 0):
+        raise ValueError(f"{r.get('symbol')}: min_piece and increment must be positive (got {mp}, {inc})")
     coupon_type = _enum(CouponType, g("coupon_type"), CouponType.FIXED)
     principal_type = _enum(PrincipalType, g("principal_type"), PrincipalType.BULLET)
     floating = None
@@ -122,8 +141,9 @@ def bond_from_row(row: pd.Series | dict) -> BondSpec:
         business_day_convention=_enum(BusinessDayConvention, g("business_day_convention"), BusinessDayConvention.FOLLOWING),
         calendar_name=str(g("calendar_name") or "US_BOND"),
         settlement_lag_days=int(lag) if lag not in (None, "") and not pd.isna(lag) else None,
-        min_piece=float(g("min_piece") or 2_000.0),
-        increment=float(g("increment") or 1_000.0),
+        min_piece=mp if mp is not None else REFERENCE_DEFAULTS["min_piece"],
+        increment=inc if inc is not None else REFERENCE_DEFAULTS["increment"],
+        tags={"reference_defaults": defaulted} if defaulted else {},
         amount_outstanding=float(g("amount_outstanding")) if g("amount_outstanding") not in (None, "") and not pd.isna(g("amount_outstanding")) else None,
         is_144a=bool(g("is_144a") or False),
         is_benchmark=bool(g("is_benchmark") or False),
@@ -137,7 +157,11 @@ def bond_from_row(row: pd.Series | dict) -> BondSpec:
 
 def reference_from_dataframe(df: pd.DataFrame) -> dict[str, BondSpec]:
     REFERENCE.validate(df)
-    return {str(row["symbol"]): bond_from_row(row) for _, row in df.iterrows()}
+    out = {str(row["symbol"]): bond_from_row(row) for _, row in df.iterrows()}
+    defaulted = sorted(s for s, b in out.items() if b.tags.get("reference_defaults"))
+    if defaulted:
+        warnings.warn(f"{len(defaulted)} bonds have no minimum piece or increment in the reference data and use {REFERENCE_DEFAULTS} ({defaulted[:5]}): supply them per ISIN", stacklevel=2)
+    return out
 
 
 def reference_to_dataframe(bonds: dict[str, BondSpec] | list[BondSpec]) -> pd.DataFrame:

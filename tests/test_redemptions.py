@@ -60,7 +60,7 @@ def env():
 @pytest.fixture(scope="module")
 def result(env):
     targets = {"MAT5": 1_000_000, "BILL": 2_000_000, "CALLB": 1_000_000, "DFLT": 1_000_000, "POOL": 1_000_000, "ENT": 1_000_000}
-    strat = BuyAndHold(BuyAndHoldConfig(strategy_id=StrategyId("BH-001"), rebalance="M", targets=targets))
+    strat = BuyAndHold(BuyAndHoldConfig(strategy_id=StrategyId("BH-001"), rebalance="BMS", targets=targets))
     return FixedIncomeBacktest(env, strat, GROSS, settings=BacktestSettings(starting_cash=20e6)).run()
 
 

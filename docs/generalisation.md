@@ -69,9 +69,9 @@ notionals. `paper.reconcile` decomposes the return gap between a spec's Paper an
 | Futures, CDS / CDX, FX forwards, IRS tradable | Margin venue: `FinancedContract` (TRS, CDX, carry instruments) and `DatedContract` (futures, FX forwards). Collateral is booked in the ledger, and it is prefunded or swept between venues by rule | `overlays`, `accounting.margin` |
 | Shorts, leverage, overlays outside the capital budget | Paper: native. Implement: shorts as synthetic bond TRS (borrow fee charged), leverage financed by repo (`FundingPolicy(repo_for_leverage=True)`), overlays on the margin venue | `paper.engine`, `overlays`, `funding.policy` |
 | Rebalance calendars | `BME`, `BMS`, `W-WED`, quarter starts and ends, every N days, index calendars, explicit dates, and `Triggered` (turnover or signal change), all in both engines | `domain.calendars` |
-| Excess return vs Treasuries | A named `ExcessReturnMethod` (VENDOR / COMPOUNDED / GEOMETRIC / DAILY_SUM). Paper reports vendor-weighted and Treasury-leg excess returns; `FixedIncomeResult.excess_returns` uses vendor bond excess returns or a duration-matched leg | `domain.conventions`, `paper.engine`, `backtest.result` |
-| Scale (9k bonds × 10y daily, monthly runs) | Paper: generate 22 s, evaluate 1 s, quintile run 4.5 s, monthly-optimised index tracking 20 s; 5.8 GB peak. Implement: 0.046 ms per bond-day build with vendor analytics (from 0.58), 0.12 ms per bond-day run (from 0.20), streamed in windows | `nautilus-fi-probes/paper_scale.py`, `implement_scale.py` |
-| Live proposals (QOE / CRD), PORT / PREP | `build_proposal` / `propose_from_spec`: bid/ask dirty pricing, settlement dates, pre-trade checks, `ColumnMap` writers, position and cash reconciliation | `propose` |
+| Excess return vs Treasuries | A named `ExcessReturnMethod` (VENDOR / COMPOUNDED / GEOMETRIC / DAILY_SUM). Paper and Implement keep the vendor-weighted and Treasury legs and aggregate them under the method (`compound_excess`: COMPOUNDED compounds each leg, then differences them); `FixedIncomeResult.excess_returns` uses vendor bond excess returns or a duration-matched leg | `domain.conventions`, `kernel.result`, `paper.engine`, `backtest.result` |
+| Scale (9k bonds × 10y daily, monthly runs) | Paper: generate 22 s, evaluate 1 s, quintile run 4.5 s, monthly-optimised index tracking 20 s; 5.8 GB peak. Implement: 0.046 ms per bond-day build with vendor analytics (from 0.58), 0.12 ms per bond-day run (from 0.20), streamed in windows | `tools/probes/paper_scale.py 9000 10`, `tools/probes/implement_scale.py`, `tools/probes/kernel_scale.py` |
+| Live proposals (QOE / CRD), PORT upload | `build_proposal` / `propose_from_spec` / `propose_from_strategy`: each trade sized and priced at ask (buys) or bid (sells) dirty and rounded once, settlement dates, minimum trades, caps, cash targets, MV reconciliation and coverage, checks with severities (blocker / approval required / warning), futures lines, PM feedback, `ColumnMap` writers (headerless QOE TSV included), a PORT-format positions upload, external books in units or notional, fill, position and cash reconciliation, and a versioned target-book export with `reconcile_book` (gold copy, adjustment rows, zero-vs-nonzero blocks). Bloomberg PORT BBU transaction exports are not covered ([operations.md](operations.md)) | `propose` |
 | Real data loaders (Snowflake / FIAtlas) | `SQLLoader` on any DB-API driver (`:start`/`:end` parameters, `::` casts left alone), `snowflake_loader` (environment-variable credentials, key-pair or SSO), a FIAtlas catalogue template, and file loaders. Every pull goes to the point-in-time and field stores | `data.loaders` |
 
 ## Conventions: named, recorded, per profile
@@ -83,10 +83,10 @@ manifests, the trial ledger and official records, and printed with every statist
 | --- | --- | --- | --- |
 | Timing (`Timing.return_lag_days`) | trading days from the information date to the end of the first earned period | 2 (trade T+1, earn T+2) | `fi_lib_research`, `EUR_IG` = 2; `MRI_v1`, `erin_beta_plus` = 1 |
 | Excess return | VENDOR, COMPOUNDED, GEOMETRIC, DAILY_SUM | COMPOUNDED, vendor first | `MRI_v1` = DAILY_SUM |
-| Benchmark weights | DRIFT, STATIC | DRIFT | `fi_lib_backtesting` = DRIFT; `erin_beta_plus` = STATIC |
+| Benchmark weights | DRIFT, STATIC (constituent files held flat between reconstitutions; published daily weights are always used as published) | DRIFT | `fi_lib_backtesting` = DRIFT; `erin_beta_plus` = STATIC |
 | Turnover | ONE_WAY_BUYS, HALF_SUM, TWO_WAY (all three always reported) | HALF_SUM | `erin_beta_plus` = ONE_WAY_BUYS; `fi_lib_backtesting` = TWO_WAY |
 | Annualisation | TRADING_252, CALENDAR_365, CALENDAR_365_25 | CALENDAR_365 (official records require it) | `paperport` = TRADING_252 |
-| Missing returns | ZERO, DROP_DATE, REFILL (with a bad-date detector), FAIL | FAIL | most = ZERO; `erin_beta_plus` = REFILL |
+| Missing returns | ZERO, DROP_DATE (bad dates removed from the run), REFILL (with a bad-date detector), FAIL; applied to held names, benchmark members, cash and the risk-free series | FAIL | most = ZERO; `erin_beta_plus` = REFILL (>= 80% exactly-zero returns; needs the refill field) |
 | Rebalance | any calendar string or object | BME | |
 | Cash | ZERO, OVERNIGHT, BILL_INDEX | OVERNIGHT | |
 
@@ -126,11 +126,14 @@ There is one example per family in `examples/` (`family1_index_timing.py` … `f
 * Margin-venue carry is settled daily as Nautilus funding on a supplied price series. CDX defaults must
   be in the supplied prices; futures rolls are the strategy's decision; FX forwards are cash-settled at
   the last price.
-* Order and position file layouts are column maps. Confirm them against the CRD, QOE, PORT and PREP
-  import specifications.
+* Order and position file layouts are column maps. Confirm them against the CRD, QOE and PORT import
+  specifications. Book reconciliation with PORT as the gold copy (`reconcile_book`) and return
+  statistics against a PREP-style export (`reconcile_returns`) are in place. Running the operational
+  service itself is decision §9.1 of the gap analysis ([operations.md](operations.md)).
 * Snowflake / FIAtlas table and column names in `fiatlas_catalog.example.json` are templates. Point them
   at the deployed views.
-* Legacy parity: the profiles reproduce the conventions; matching each framework's numbers needs its
-  golden outputs.
+* Legacy parity: each framework has an adapter with a parity harness ([adapters.md](adapters.md)).
+  Matching each framework's numbers needs its golden outputs, so no profile is confirmed yet.
 * Implement at full index scale: build and run are fast with vendor analytics. Per-bond-day objects
-  still cost about 1–2 KB, so very large universes need memory sized accordingly, or the Paper engine.
+  still cost about 1–2 KB. `run_implement` sizes a run before building it and raises `MemoryError`
+  when it does not fit, naming a sample of names, a shorter window or the Paper engine.

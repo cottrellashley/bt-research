@@ -51,7 +51,7 @@ import numpy as np
 import pandas as pd
 
 from nautilus_fi.core.fileio import atomic_write_text, file_lock
-from nautilus_fi.data.panel import Panel
+from nautilus_fi.data.panel import DataQualityError, Panel
 from nautilus_fi.domain.fields import field_def
 
 ASSET, ATTRIBUTE, SERIES, OVERLAY = "asset", "attribute", "series", "overlay"
@@ -75,6 +75,8 @@ class MissingDataError(ValueError):
     """Data a strategy component needs is absent: the message says which and what to do."""
 
 
+
+
 # ====================================================================================== catalogue
 @dataclass(frozen=True)
 class FieldInfo:
@@ -89,12 +91,19 @@ class FieldInfo:
     start: str | None = None
     end: str | None = None
     tags: tuple[str, ...] = ()
+    label: str = "end"                     # end: a value covers the period ending on its date | start: the period starting on it (START_DATE labelling)
+    form: str = "simple"                   # a return field's form: simple | log | price (levels: returns are their changes) | cumulative (additive, fraction)
+    categories: tuple = ()                 # labels of a coded category field (code k is categories[k]): dated sector / rating / issuer maps
 
     def __post_init__(self) -> None:
         if self.entity not in ENTITIES:
             raise ValueError(f"FieldInfo.entity must be one of {ENTITIES}, not {self.entity!r}")
         if self.lag < 0:
             raise ValueError(f"field {self.name}: a negative availability lag would read the future")
+        if self.label not in ("end", "start"):
+            raise ValueError(f"field {self.name}: label must be 'end' or 'start', not {self.label!r}")
+        if self.form not in ("simple", "log", "price", "cumulative"):
+            raise ValueError(f"field {self.name}: form must be simple, log, price or cumulative, not {self.form!r}")
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -114,7 +123,7 @@ def fields_from_dictionary(df: pd.DataFrame, source: str = "") -> list[FieldInfo
     ``end``, ``tags``): how a company platform's own metadata becomes a kernel catalogue."""
     out = []
     for rec in df.to_dict("records"):
-        kw = {k: rec[k] for k in ("description", "unit", "kind", "entity", "frequency", "start", "end") if k in rec and pd.notna(rec[k])}
+        kw = {k: rec[k] for k in ("description", "unit", "kind", "entity", "frequency", "start", "end", "label") if k in rec and pd.notna(rec[k])}
         if "lag" in rec and pd.notna(rec["lag"]):
             kw["lag"] = int(rec["lag"])
         if "tags" in rec and isinstance(rec["tags"], str):
@@ -268,15 +277,22 @@ def align(panels: list[Panel], dates: pd.DatetimeIndex | None = None, ids: pd.In
         ri = None if same else all_dates.get_indexer(p.dates)
         ci = None if same else all_ids.get_indexer(p.ids)
         for k, v in p.values.items():
-            if k in vals:
-                continue
             if same:
-                vals[k] = v
+                m = v
             else:
                 m = np.full((len(all_dates), len(all_ids)), np.nan, dtype=np.float64 if v.dtype.kind != "f" else v.dtype)
                 ok_r, ok_c = ri >= 0, ci >= 0
                 m[np.ix_(ri[ok_r], ci[ok_c])] = v[np.ix_(ok_r, ok_c)]
-                vals[k] = m
+            if k in vals:                                     # a field from two panels: they must agree where both have it
+                a, b = np.asarray(vals[k], dtype=np.float64), np.asarray(m, dtype=np.float64)
+                both = np.isfinite(a) & np.isfinite(b)
+                clash = both & ~np.isclose(a, b, rtol=1e-9, atol=1e-12)
+                if clash.any():
+                    r, c = np.argwhere(clash)[0]
+                    raise DataQualityError(f"field {k!r} comes from more than one panel and they disagree on {int(clash.sum())} values (first {all_dates[r]:%Y-%m-%d} {all_ids[c]}: {a[r, c]:.6g} vs {b[r, c]:.6g}); keep one source per field")
+                vals[k] = np.where(np.isfinite(a), a, b)
+                continue
+            vals[k] = m
             lags[k] = p.lags.get(k, 0)
     return Panel(pd.DatetimeIndex(all_dates), pd.Index(all_ids), vals, lags)
 
@@ -334,6 +350,12 @@ class DataSource:
     def version(self) -> str | None:
         return None
 
+    def point_in_time(self) -> bool | None:
+        """Whether every value is as it was first known (no later revisions): True when the source
+        can show it (knowledge-time reads of first publications, generated data), False when it
+        serves revised vintages, None when it cannot say. Official records need True."""
+        return getattr(self, "_point_in_time", None)
+
     # ------------------------------------------------------------------ conveniences
     def panel(self, fields: Iterable[str], start=None, end=None, ids: Iterable[str] | None = None, as_of=None, entity: str = ASSET) -> Panel:
         return self.load(DataRequest(tuple(fields), start, end, None if ids is None else tuple(ids), as_of, entity))
@@ -375,7 +397,8 @@ class PanelSource(DataSource):
     constituents and an overlay panel, all in memory. Knowledge-time reads are not supported
     (``as_of`` is ignored with a warning); availability lags come from ``fields`` or the panel."""
 
-    def __init__(self, panel: Panel, attributes: pd.DataFrame | None = None, series: pd.DataFrame | Mapping[str, pd.Series] | None = None, constituents: Mapping[str, pd.DataFrame] | None = None, overlays: Panel | None = None, fields: Iterable[FieldInfo] | None = None, name: str = "panel", version: str | None = None, environment: Callable | None = None) -> None:
+    def __init__(self, panel: Panel, attributes: pd.DataFrame | None = None, series: pd.DataFrame | Mapping[str, pd.Series] | None = None, constituents: Mapping[str, pd.DataFrame] | None = None, overlays: Panel | None = None, fields: Iterable[FieldInfo] | None = None, name: str = "panel", version: str | None = None, environment: Callable | None = None, point_in_time: bool | None = None) -> None:
+        self._point_in_time = point_in_time
         self._panel = panel
         self._attrs = attributes if attributes is not None else pd.DataFrame(index=panel.ids)
         self._attrs.index = self._attrs.index.astype(str)
@@ -474,15 +497,28 @@ class FrameSource(PanelSource):
     """pandas in, source out: ``fields`` as ``{name: wide frame (dates x ids)}`` or one long frame
     (date, instrument_id, one column per field)."""
 
-    def __init__(self, fields: Mapping[str, pd.DataFrame] | pd.DataFrame, attributes: pd.DataFrame | None = None, series=None, constituents=None, overlays: Mapping[str, pd.DataFrame] | None = None, info: Iterable[FieldInfo] | None = None, name: str = "frames", lags: Mapping[str, int] | None = None, date_col: str = "date", id_col: str = "instrument_id", version: str | None = None) -> None:
+    def __init__(self, fields: Mapping[str, pd.DataFrame] | pd.DataFrame, attributes: pd.DataFrame | None = None, series=None, constituents=None, overlays: Mapping[str, pd.DataFrame] | None = None, info: Iterable[FieldInfo] | None = None, name: str = "frames", lags: Mapping[str, int] | None = None, date_col: str = "date", id_col: str = "instrument_id", version: str | None = None, calendar=None, point_in_time: bool | None = None, categories: Mapping[str, pd.DataFrame] | None = None) -> None:
+        """``categories``: dated category fields as wide frames of labels (a sector or rating map that
+        changes over time), coded into the panel with their labels in the catalogue."""
+        info = list(info or [])
+        if categories:
+            if isinstance(fields, pd.DataFrame):
+                raise TypeError("categories go with wide fields ({name: frame}); add the coded column to a long frame instead")
+            fields = dict(fields)
+            for k, frame in categories.items():
+                labels = sorted({str(v) for v in pd.unique(frame.to_numpy().ravel()) if not pd.isna(v)})
+                code = {lab: float(i) for i, lab in enumerate(labels)}
+                fields[k] = frame.apply(lambda col, code=code: col.map(lambda x, code=code: np.nan if pd.isna(x) else code.get(str(x), np.nan)))
+                info.append(FieldInfo(k, f"dated category ({len(labels)} labels)", "", "category", categories=tuple(labels), source=name))
         if isinstance(fields, pd.DataFrame):
             panel = Panel.from_long(fields, date_col=date_col, id_col=id_col)
         else:
-            panel = Panel.from_wide(dict(fields))
+            panel = Panel.from_wide(dict(fields), calendar=calendar)
+        self.snapped_observations = int(getattr(panel, "snapped", 0))
         for k, v in (lags or {}).items():
             panel.lags[k] = int(v)
         ov = Panel.from_wide(dict(overlays)) if overlays else None
-        super().__init__(panel, attributes, series, constituents, ov, info, name, version)
+        super().__init__(panel, attributes, series, constituents, ov, info, name, version, point_in_time=point_in_time)
 
 
 class SyntheticSource(PanelSource):
@@ -502,7 +538,7 @@ class SyntheticSource(PanelSource):
         series = {"cash": d.cash, **{f"index.{c}": d.index[c] for c in d.index.columns}, **{f"treasury.{c}": d.treasury[c] for c in d.treasury.columns}}
         info = [field_info("signal.value", description="synthetic value signal: idiosyncratic spread plus noise (genuine but noisy skill)"), field_info("alive", description="1 while the bond exists (issued and not matured or defaulted)", kind="flag"),
                 FieldInfo("cash", "overnight cash return per period", "fraction", "numeric", SERIES, 0, "D", name)]
-        super().__init__(d.panel, d.attributes, series, {self.INDEX: d.membership}, d.overlays, info, name, "synthetic:" + hashlib.sha1(repr(cfg).encode()).hexdigest()[:16], self._environment)
+        super().__init__(d.panel, d.attributes, series, {self.INDEX: d.membership}, d.overlays, info, name, "synthetic:" + hashlib.sha1(repr(cfg).encode()).hexdigest()[:16], self._environment, point_in_time=True)     # generated once: never revised
 
     def _environment(self, start, end, ids=None):
         from nautilus_fi.data.loaders.base import builder_from_frames
@@ -522,7 +558,8 @@ class CallableSource(DataSource):
     ``f(ids, names) -> frame``; ``series``: a dict of series or ``f(name, start, end) -> series``;
     ``constituents``: a dict of frames or ``f(index, start, end) -> frame``."""
 
-    def __init__(self, fetch: Callable, fields, attributes=None, series=None, constituents=None, name: str = "callable", version: str | Callable[[], str] | None = None, indices: Iterable[str] = (), overlay_fetch: Callable | None = None) -> None:
+    def __init__(self, fetch: Callable, fields, attributes=None, series=None, constituents=None, name: str = "callable", version: str | Callable[[], str] | None = None, indices: Iterable[str] = (), overlay_fetch: Callable | None = None, point_in_time: bool | None = None) -> None:
+        self._point_in_time = point_in_time
         self._fetch = fetch
         if isinstance(fields, Mapping):
             fields = [field_info(k, description=v) if isinstance(v, str) else v for k, v in fields.items()]
@@ -652,6 +689,9 @@ class FieldStoreSource(DataSource):
         snaps = sorted(str(p) for f in self.store.fields() for _, p in self.store.snapshots(f))
         return "fieldstore:" + hashlib.sha1(("\n".join(snaps) + self.mode).encode()).hexdigest()[:16]
 
+    def point_in_time(self) -> bool | None:
+        return self.mode == "first"                           # first publications; "latest" serves revisions
+
 
 class SQLSource(DataSource):
     """Dataset mappings (``data.loaders.DatasetMapping``) on a DB-API connection as a source. The
@@ -661,7 +701,8 @@ class SQLSource(DataSource):
 
     KEYS = ("date", "instrument_id", "publish_ts")
 
-    def __init__(self, loader, mappings, attributes=None, series: Mapping[str, tuple] | None = None, constituents: Mapping[str, object] | None = None, lags: Mapping[str, int] | None = None, name: str = "sql", version: str | None = None) -> None:
+    def __init__(self, loader, mappings, attributes=None, series: Mapping[str, tuple] | None = None, constituents: Mapping[str, object] | None = None, lags: Mapping[str, int] | None = None, name: str = "sql", version: str | None = None, point_in_time: bool | None = None) -> None:
+        self._point_in_time = point_in_time
         self.loader = loader
         self.mappings = {m.name: m for m in mappings} if not isinstance(mappings, Mapping) else dict(mappings)
         self._attrs = attributes
@@ -820,6 +861,10 @@ class CompositeSource(DataSource):
         vs = [s.version() for s in self.sources]
         return None if any(v is None for v in vs) else "composite:" + hashlib.sha1("|".join(vs).encode()).hexdigest()[:16]
 
+    def point_in_time(self) -> bool | None:
+        vs = [s.point_in_time() for s in self.sources]
+        return False if any(v is False for v in vs) else (True if all(v is True for v in vs) else None)
+
 
 class MappedSource(DataSource):
     """Identifier mapping: ``mapping`` maps the kernel's ids to the inner source's ids (a dict or a
@@ -871,6 +916,9 @@ class MappedSource(DataSource):
     def version(self) -> str | None:
         v = self.inner.version()
         return None if v is None else f"{v}+map:{frame_fingerprint(self.to_inner)}"
+
+    def point_in_time(self) -> bool | None:
+        return self.inner.point_in_time()
 
 
 # ====================================================================================== caching
@@ -941,6 +989,9 @@ class CachedSource(DataSource):
         if self._cat is None:
             self._cat = self.inner.catalog()
         return self._cat
+
+    def point_in_time(self) -> bool | None:
+        return self.inner.point_in_time()
 
     def version(self) -> str | None:
         v = self.inner.version()
@@ -1084,6 +1135,7 @@ __all__ = [
     "CallableSource",
     "Catalog",
     "CompositeSource",
+    "DataQualityError",
     "DataRequest",
     "DataSource",
     "FieldInfo",

@@ -32,7 +32,7 @@ def main(quick: bool = False) -> None:
     print(env.marks_frame()["tier"].value_counts().to_string(), "\n")
 
     def make_strategy():
-        return CarryValueStrategy(CarryValueConfig(strategy_id=StrategyId("CARRY-001"), rebalance="M", n_long=10, log_decisions=False))
+        return CarryValueStrategy(CarryValueConfig(strategy_id=StrategyId("CARRY-001"), rebalance="BMS", n_long=10, log_decisions=False))
 
     t1 = time.time()
     results = run_execution_ladder(env, make_strategy, [GROSS, NET_SPREAD, NET_FULL], settings=BacktestSettings(starting_cash=100e6))

@@ -129,7 +129,7 @@ class SpecStrategyConfig(FixedIncomeStrategyConfig):
 
 class SpecStrategy(FixedIncomeStrategy):
     def __new__(cls, spec: ResearchSpec | None = None, config: SpecStrategyConfig | None = None, *args, **kwargs):  # the PyO3 base takes the config only
-        return super().__new__(cls, config or SpecStrategyConfig(rebalance=spec.rebalance if spec is not None else "M"))
+        return super().__new__(cls, config or SpecStrategyConfig(rebalance=spec.rebalance if spec is not None else "BMS"))
 
     def __init__(self, spec: ResearchSpec, config: SpecStrategyConfig | None = None) -> None:
         cfg = config or SpecStrategyConfig(rebalance=spec.rebalance)

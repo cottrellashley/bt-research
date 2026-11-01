@@ -45,16 +45,17 @@ def walk_forward(make_spec: Callable[[dict], ResearchSpec], candidates: list[dic
     base = settings or PaperSettings()
     dates = data.panel.dates
     rows, oos, results = [], [], []
+    lag = (base.conventions or make_spec(candidates[0]).conventions).timing.trade_offset_days if candidates else 0
     for k, sp in enumerate(splits):
         dev = np.nonzero((dates >= pd.Timestamp(sp.dev_start)) & (dates < pd.Timestamp(sp.dev_end)))[0]
         val_lo, val_hi = pd.Timestamp(sp.dev_end), pd.Timestamp(sp.val_end) - pd.Timedelta(days=1)
         test_lo, test_hi = pd.Timestamp(sp.test_start), pd.Timestamp(sp.test_end) - pd.Timedelta(days=1)
-        keep_val = purged_train_indices(dates[dev], val_lo, val_hi, label_horizon_days, embargo_days, unit="trading", trading_days=dates)
+        keep_val = purged_train_indices(dates[dev], val_lo, val_hi, label_horizon_days, embargo_days, unit="trading", trading_days=dates, execution_lag_days=lag)
         train_val = dev[keep_val]
         best, best_score, best_params = None, -np.inf, None
         for params in candidates:
             spec = make_spec(params)
-            spec = replace(spec, decider=spec.decider.fit({"panel": data.panel, "rows": train_val, "params": params}), hypothesis_id=hypothesis_id or spec.hypothesis_id)
+            spec = replace(spec, decider=spec.decider.fit({"panel": data.panel.subset(end=val_lo - pd.Timedelta(days=1)), "rows": train_val, "params": params}), hypothesis_id=hypothesis_id or spec.hypothesis_id)     # fit sees nothing from the window it is scored on
             res = PaperEngine(spec, data, replace(base, start=val_lo, end=val_hi, name=f"{spec.name}[val{k}]")).run(ledger=ledger, stage="VALIDATION") if ledger is not None else PaperEngine(spec, data, replace(base, start=val_lo, end=val_hi)).run()
             sc = _score(res, metric)
             if sc > best_score:
@@ -62,9 +63,9 @@ def walk_forward(make_spec: Callable[[dict], ResearchSpec], candidates: list[dic
         if best is None:
             continue
         devval = np.nonzero((dates >= pd.Timestamp(sp.dev_start)) & (dates <= val_hi))[0]
-        keep_test = purged_train_indices(dates[devval], test_lo, test_hi, label_horizon_days, embargo_days, unit="trading", trading_days=dates)
+        keep_test = purged_train_indices(dates[devval], test_lo, test_hi, label_horizon_days, embargo_days, unit="trading", trading_days=dates, execution_lag_days=lag)
         spec = make_spec(best_params)
-        spec = replace(spec, decider=spec.decider.fit({"panel": data.panel, "rows": devval[keep_test], "params": best_params}), hypothesis_id=hypothesis_id or spec.hypothesis_id)
+        spec = replace(spec, decider=spec.decider.fit({"panel": data.panel.subset(end=test_lo - pd.Timedelta(days=1)), "rows": devval[keep_test], "params": best_params}), hypothesis_id=hypothesis_id or spec.hypothesis_id)
         tset = replace(base, start=test_lo, end=test_hi, name=f"{spec.name}[test{k}]")
         test = PaperEngine(spec, data, tset).run(ledger=ledger, stage="OOS") if ledger is not None else PaperEngine(spec, data, tset).run()
         results.append(test)

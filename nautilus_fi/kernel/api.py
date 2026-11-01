@@ -23,7 +23,7 @@ Every run goes through the session, so the trial count behind any statistic is t
 from __future__ import annotations
 
 from nautilus_fi.kernel.data import as_source
-from nautilus_fi.kernel.session import Session
+from nautilus_fi.kernel.session import DEFAULT, Session
 
 _DEFAULT: Session | None = None
 
@@ -77,9 +77,11 @@ def explain(variant, base):
     return variant.explain(base)
 
 
-def promote(result, level: str = "CANDIDATE", implement=None, session: Session | None = None):
-    """Submit a result through the official-record gates (raises ``GateFailure`` with every failed check)."""
-    return (session or current_session()).promote(result, level, implement)
+def promote(result, level: str = "CANDIDATE", implement=None, session: Session | None = None, min_dsr=DEFAULT, max_pbo=DEFAULT, thresholds: dict | None = None):
+    """Submit a result through the official-record gates (raises ``GateFailure`` with every failed
+    check); ``min_dsr`` / ``max_pbo`` / ``thresholds`` override the registry's default thresholds
+    (None: recorded, not gated)."""
+    return (session or current_session()).promote(result, level, implement, min_dsr=min_dsr, max_pbo=max_pbo, thresholds=thresholds)
 
 
 def evaluate(signal, source=None, universe=None, start=None, end=None, window=None, horizons=(1, 5, 21, 63), schedule: str = "BME", returns: str = "xr", lag: int = 1, quantiles: int = 5, weighting: str = "equal", neutralise_groups: tuple = (), session: Session | None = None, name: str | None = None):
@@ -94,7 +96,7 @@ def evaluate(signal, source=None, universe=None, start=None, end=None, window=No
     from nautilus_fi.domain.conventions import Conventions, Timing
     from nautilus_fi.kernel.engine import prepare
     from nautilus_fi.kernel.expr import Field, alive_mask
-    from nautilus_fi.kernel.mechanics import NextClose
+    from nautilus_fi.kernel.mechanics import NextClose, SameClose
     from nautilus_fi.kernel.strategy import Strategy
     from nautilus_fi.paper.evaluate import EvaluationSettings, evaluate_signal
 
@@ -104,7 +106,7 @@ def evaluate(signal, source=None, universe=None, start=None, end=None, window=No
 
     lo, hi = _window(start, end, window) if (start is not None or end is not None or window is not None) else (sess.start, sess.end)
     sig = Field(signal) if isinstance(signal, str) else signal
-    probe = Strategy(name or repr(sig), universe=universe, signal=sig, returns=returns, execution=NextClose(lag), schedule=schedule)
+    probe = Strategy(name or repr(sig), universe=universe, signal=sig, returns=returns, execution=NextClose(lag) if lag >= 1 else SameClose(), schedule=schedule)
     prep = prepare([probe], src, lo, hi, extra_fields=("index_weight",) if weighting == "benchmark" else ())
     s = probe.resolved()
     ctx = prep.ctx_for(s)

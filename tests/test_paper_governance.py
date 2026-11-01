@@ -171,6 +171,16 @@ def test_record_gates_and_hash_chain(tmp_path, synth):
     reg = RecordRegistry(tmp_path / "records")
     rec = reg.submit(RecordLevel.EXPLORATORY, res, spec, led)
     assert rec.level == "EXPLORATORY" and (tmp_path / "records" / f"{rec.record_id}.md").exists()
+    with pytest.raises(GateFailure) as weak:                    # it meets its own failure criterion (IR < 0.3)
+        reg.submit(RecordLevel.CANDIDATE, res, spec, led)
+    assert "failure_criteria" in weak.value.failed
+    h2 = _hyp("REC2")
+    h2.failure_criteria = "max_drawdown < -50%"
+    h2.holdout_period = ("2030-01-01", "2030-12-31")
+    led.register(h2)
+    spec = ResearchSpec("q5", FieldSignal("signal.value"), ConstructionSpec(Quantile(5)), hypothesis_id="REC2", conventions=Conventions(missing_returns=MissingReturnPolicy.ZERO))
+    res = PaperEngine(spec, _data(synth)).run(ledger=led)
+    reg = RecordRegistry(tmp_path / "records", min_dsr=None)
     cand = reg.submit(RecordLevel.CANDIDATE, res, spec, led)
     assert cand.checks["trial_in_ledger"]["ok"] and cand.prev_hash == rec.hash
     with pytest.raises(GateFailure) as e:

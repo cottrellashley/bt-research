@@ -19,7 +19,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,10 +26,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from nautilus_fi.research.experiment import ExperimentRecord, ExperimentRegistry, Hypothesis
+from nautilus_fi.research.experiment import ExperimentRecord, ExperimentRegistry, HoldoutViolation, Hypothesis
 from nautilus_fi.research.statistics import deflated_sharpe_ratio, probability_of_backtest_overfitting
 
 STAGES = ("EVALUATE", "PAPER", "IMPLEMENT", "OOS", "VALIDATION")
+COUNTED_STAGES = ("PAPER", "IMPLEMENT", "VALIDATION")     # what a trial is, for every count (n_trials, DSR, PBO)
+
+
+class LedgerError(RuntimeError):
+    """The ledger cannot be read completely: counts built on it would understate the search."""
 
 
 @dataclass
@@ -51,6 +55,8 @@ class Trial:
     returns_file: str | None = None
     session: str = ""
     description: str = ""
+    data_version: str = ""                     # the source version the trial ran on
+    universe: str = ""                         # the universe it selected from (search-scope matching)
 
 
 def _clean(v):
@@ -71,11 +77,9 @@ class TrialLedger:
 
     # ------------------------------------------------------------------ hypotheses
     def register(self, h: Hypothesis) -> Hypothesis:
-        """Pre-register a hypothesis (its timestamp must precede every trial that cites it)."""
-        self.registry.reload()
-        if h.hypothesis_id in self.registry.hypotheses:
-            raise ValueError(f"hypothesis {h.hypothesis_id} already registered; register a new id for a changed hypothesis")
-        return self.registry.register(h)
+        """Pre-register a hypothesis: the registry stamps the registration time (a supplied one is
+        ignored) and freezes the content by hash; an id can be registered once, atomically."""
+        return self.registry.register_new(h)
 
     def hypothesis(self, hypothesis_id: str) -> Hypothesis | None:
         if hypothesis_id not in self.registry.hypotheses:
@@ -83,9 +87,16 @@ class TrialLedger:
         return self.registry.hypotheses.get(hypothesis_id)
 
     # ------------------------------------------------------------------ recording
-    def record(self, stage: str, name: str, spec_hash: str, variant: dict, period: tuple[str, str], summary: dict, returns: pd.Series | None = None, hypothesis_id: str | None = None, conventions: dict | None = None, uses_holdout: bool = False, status: str = "COMPLETED", note: str = "", session: str = "", description: str = "") -> Trial:
+    def record(self, stage: str, name: str, spec_hash: str, variant: dict, period: tuple[str, str], summary: dict, returns: pd.Series | None = None, hypothesis_id: str | None = None, conventions: dict | None = None, uses_holdout: bool = False, status: str = "COMPLETED", note: str = "", session: str = "", description: str = "", data_version: str = "", universe: str = "") -> Trial:
         if stage not in STAGES:
             raise ValueError(f"unknown stage {stage!r}; use one of {STAGES}")
+        payload = json.dumps([stage, name, spec_hash, variant, period, hypothesis_id, session, data_version or ""], sort_keys=True, default=str)
+        tid = hashlib.sha256(payload.encode()).hexdigest()[:16]
+        existing = self._find(tid)
+        if existing is not None:                                 # idempotent: the same trial recorded again is the same record
+            if existing.uses_holdout and existing.hypothesis_id is not None:
+                raise HoldoutViolation(f"holdout for {existing.hypothesis_id} already viewed (trial {existing.trial_id}): running it again is a second look")
+            return existing
         if hypothesis_id is not None:
             self.registry.reload()
             if hypothesis_id not in self.registry.hypotheses:
@@ -93,8 +104,6 @@ class TrialLedger:
             # holdout guard (raises HoldoutViolation)
             self.registry.record(ExperimentRecord(hypothesis_id, spec_hash, {k: _clean(v) for k, v in variant.items()}, period, {}, status, uses_holdout, note))
             uses_holdout = self.registry.records[-1].uses_holdout
-        payload = json.dumps([stage, name, spec_hash, variant, period, hypothesis_id, session, uuid.uuid4().hex], sort_keys=True, default=str)
-        tid = hashlib.sha256(payload.encode()).hexdigest()[:16]
         rfile = None
         if returns is not None and len(returns):
             from nautilus_fi.core.fileio import tmp_path
@@ -103,12 +112,30 @@ class TrialLedger:
             tmp = tmp_path(self.root / rfile)
             pd.DataFrame({"date": pd.to_datetime(returns.index), "ret": returns.to_numpy(dtype=float)}).to_parquet(tmp, index=False)
             tmp.replace(self.root / rfile)
-        trial = Trial(tid, hypothesis_id, stage, name, spec_hash, {k: _clean(v) for k, v in variant.items()}, (str(period[0]), str(period[1])), {k: _clean(v) for k, v in summary.items() if isinstance(_clean(v), (int, float, str, bool, type(None)))}, conventions or {}, uses_holdout, status, note, returns_file=rfile, session=session, description=description)
+        trial = Trial(tid, hypothesis_id, stage, name, spec_hash, {k: _clean(v) for k, v in variant.items()}, (str(period[0]), str(period[1])), {k: _clean(v) for k, v in summary.items() if isinstance(_clean(v), (int, float, str, bool, type(None)))}, conventions or {}, uses_holdout, status, note, returns_file=rfile, session=session, description=description, data_version=data_version or "", universe=universe or "")
         from nautilus_fi.core.fileio import atomic_write_text
 
         stamp = trial.created_utc.replace(":", "").replace("-", "").replace("+", "")
         atomic_write_text(self.root / "trials" / f"{stamp}-{tid}.json", json.dumps(asdict(trial), default=str))
         return trial
+
+    def _find(self, tid: str) -> Trial | None:
+        folder = self.root / "trials"
+        for f in folder.glob(f"*-{tid}.json"):
+            d = json.loads(f.read_text())
+            d["period"] = tuple(d["period"])
+            return Trial(**{k: v for k, v in d.items() if k in Trial.__dataclass_fields__})
+        return None
+
+    def rebuild_index(self) -> tuple[pd.DataFrame, list[str]]:
+        """Re-read every trial file into one index (``index.parquet``) and list problems (a returns
+        file that is missing): the ledger's state rebuilt from its append-only records."""
+        rows = self.trials_list()
+        problems = [f"{t['trial_id']}: returns file {t['returns_file']} missing" for t in rows if t.get("returns_file") and not (self.root / t["returns_file"]).exists()]
+        df = pd.DataFrame([{k: (json.dumps(v, default=str) if isinstance(v, (dict, list, tuple)) else v) for k, v in t.items()} for t in rows])
+        if len(df):
+            df.to_parquet(self.root / "index.parquet", index=False)
+        return df, problems
 
     def record_result(self, result, spec=None, stage: str = "PAPER", uses_holdout: bool = False, hypothesis_id: str | None = None, note: str = "") -> Trial:
         """Record a ``PaperResult`` or a ``FixedIncomeResult``."""
@@ -137,10 +164,12 @@ class TrialLedger:
         folder = self.root / "trials"
         if folder.exists():
             for f in sorted(folder.glob("*.json")):
+                if f.name.startswith("."):                       # a file being written right now (atomic_write_text's temporary)
+                    continue
                 try:
                     rows.append(json.loads(f.read_text()))
-                except (json.JSONDecodeError, OSError):          # a file being replaced right now: skip it
-                    continue
+                except (json.JSONDecodeError, OSError) as e:
+                    raise LedgerError(f"trial file {f.name} cannot be read ({e}): the ledger is incomplete, so trial counts would be understated; restore or remove it explicitly") from e
         rows.sort(key=lambda t: t.get("created_utc", ""))
         return rows
 
@@ -155,43 +184,93 @@ class TrialLedger:
         flat = [{**{k: v for k, v in t.items() if k not in ("summary", "variant", "conventions")}, **{f"param.{k}": v for k, v in t["variant"].items()}, **{f"result.{k}": v for k, v in t["summary"].items()}} for t in rows]
         return pd.DataFrame(flat)
 
-    def n_trials(self, hypothesis_id: str | None, stages: tuple[str, ...] = ("PAPER", "IMPLEMENT", "VALIDATION"), session: str | None = None) -> int:
-        return sum(1 for t in self.trials_list() if self._match(t, hypothesis_id, stages, session) and not t["uses_holdout"])
+    @staticmethod
+    def _identity(t: dict) -> tuple:
+        return (t["spec_hash"], t.get("data_version", ""))
 
-    def trial_returns(self, hypothesis_id: str | None, stages: tuple[str, ...] = ("PAPER", "VALIDATION"), session: str | None = None) -> dict[str, pd.Series]:
-        out = {}
-        for t in self.trials_list():
-            if not self._match(t, hypothesis_id, stages, session) or t["uses_holdout"] or not t.get("returns_file"):
-                continue
-            df = pd.read_parquet(self.root / t["returns_file"])
-            out[t["trial_id"]] = pd.Series(df["ret"].to_numpy(), index=pd.to_datetime(df["date"]))
+    def counted(self, hypothesis_id: str | None = None, stages: tuple[str, ...] = COUNTED_STAGES, session: str | None = None, trials: list[dict] | None = None) -> list[dict]:
+        """The trials counted for multiple testing, one per distinct (strategy, data version):
+        Paper, Validation and Implement runs that did not use the holdout (re-running a strategy, or
+        running it at another fidelity, is not a new trial). The latest record of each is kept."""
+        groups: dict[tuple, list[dict]] = {}
+        for t in (trials if trials is not None else self.trials_list()):
+            if self._match(t, hypothesis_id, stages, session) and not t["uses_holdout"]:
+                groups.setdefault(self._identity(t), []).append(t)
+        out = []
+        for ts in groups.values():                            # one record per trial: Paper / Validation returns over an Implement run's
+            pool = [t for t in ts if t.get("returns_file")] or ts
+            out.append(max(pool, key=lambda t: (t["stage"] != "IMPLEMENT", t.get("created_utc", ""))))
         return out
 
-    def returns_matrix(self, hypothesis_id: str | None, stages: tuple[str, ...] = ("PAPER", "VALIDATION"), session: str | None = None) -> pd.DataFrame:
+    def scope(self, universe: str = "", period: tuple[str, str] | None = None, data_version: str = "") -> list[dict]:
+        """The search a promoted result was selected from: every counted trial, whatever hypothesis
+        it was filed under (or none), on the same universe (or none recorded) whose period overlaps
+        ``period`` and which ran on the same data version (or none recorded)."""
+        out = []
+        for t in self.trials_list():
+            if universe and t.get("universe") and t["universe"] != universe:
+                continue
+            if data_version and t.get("data_version") and t["data_version"] != data_version:
+                continue
+            if period is not None and t.get("period") and (str(t["period"][1]) < str(period[0]) or str(t["period"][0]) > str(period[1])):
+                continue
+            out.append(t)
+        return self.counted(None, COUNTED_STAGES, None, out)
+
+    def n_trials(self, hypothesis_id: str | None, stages: tuple[str, ...] = COUNTED_STAGES, session: str | None = None) -> int:
+        return len(self.counted(hypothesis_id, stages, session))
+
+    def _returns_of(self, trials: list[dict]) -> dict[str, pd.Series]:
+        """Trial returns, one per distinct series: a strategy relabelled (another hypothesis, name or
+        session) earns exactly what it earned before and is not a new draw."""
+        out, seen = {}, set()
+        for t in trials:
+            if not t.get("returns_file"):
+                continue
+            df = pd.read_parquet(self.root / t["returns_file"])
+            r = pd.Series(df["ret"].to_numpy(), index=pd.to_datetime(df["date"]))
+            sig = hashlib.sha256(pd.util.hash_pandas_object(r, index=True).to_numpy().tobytes()).hexdigest()
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out[t["trial_id"]] = r
+        return out
+
+    def n_distinct(self, trials: list[dict]) -> int:
+        """Trials that are distinct draws: distinct return series, plus trials recorded without returns."""
+        return len(self._returns_of(trials)) + sum(1 for t in trials if not t.get("returns_file"))
+
+    def trial_returns(self, hypothesis_id: str | None, stages: tuple[str, ...] = COUNTED_STAGES, session: str | None = None) -> dict[str, pd.Series]:
+        return self._returns_of(self.counted(hypothesis_id, stages, session))
+
+    def returns_matrix(self, hypothesis_id: str | None, stages: tuple[str, ...] = COUNTED_STAGES, session: str | None = None, trials: list[dict] | None = None) -> pd.DataFrame:
         """Trial returns aligned on their common dates (what PBO needs)."""
-        cols = self.trial_returns(hypothesis_id, stages, session)
+        cols = self._returns_of(trials) if trials is not None else self.trial_returns(hypothesis_id, stages, session)
         return pd.DataFrame(cols).dropna() if cols else pd.DataFrame()
 
-    def sharpe_variance(self, hypothesis_id: str | None, stages: tuple[str, ...] = ("PAPER", "VALIDATION"), session: str | None = None) -> float | None:
+    def sharpe_variance(self, hypothesis_id: str | None, stages: tuple[str, ...] = COUNTED_STAGES, session: str | None = None, trials: list[dict] | None = None) -> float | None:
         """Cross-trial variance of per-period Sharpe ratios, each on its own dates (what the deflated
         Sharpe ratio needs; walk-forward validation windows do not overlap)."""
-        series = self.trial_returns(hypothesis_id, stages, session)
+        series = self._returns_of(trials) if trials is not None else self.trial_returns(hypothesis_id, stages, session)
         sr = [float(r.mean() / r.std(ddof=1)) for r in series.values() if len(r) > 2 and r.std(ddof=1) > 0]
         if len(sr) < 2:
             return None
         return float(np.var(sr, ddof=1))
 
-    def deflated_sharpe(self, hypothesis_id: str | None, returns: pd.Series, periods_per_year: float = 252.0, stages: tuple[str, ...] = ("PAPER", "VALIDATION"), session: str | None = None) -> dict:
+    def deflated_sharpe(self, hypothesis_id: str | None, returns: pd.Series, periods_per_year: float = 252.0, stages: tuple[str, ...] = COUNTED_STAGES, session: str | None = None, trials: list[dict] | None = None) -> dict:
+        """The deflated Sharpe ratio of ``returns`` given the trials (``trials``: an explicit set,
+        e.g. ``scope(...)``; else the hypothesis's counted trials)."""
         r = pd.Series(returns).dropna()
-        n = max(self.n_trials(hypothesis_id, stages, session), 1)
-        var = self.sharpe_variance(hypothesis_id, stages, session)
+        group = trials if trials is not None else self.counted(hypothesis_id, stages, session)
+        n = max(self.n_distinct(group), 1)
+        var = self.sharpe_variance(None, trials=group)
         sr = float(r.mean() / r.std(ddof=1) * math.sqrt(periods_per_year)) if r.std(ddof=1) else float("nan")
         out = deflated_sharpe_ratio(sr, n, len(r), float(r.skew()), float(r.kurt() + 3.0), var, round(periods_per_year))
         out["ledger_trials"] = n
         return out
 
-    def pbo(self, hypothesis_id: str | None, n_splits: int = 8, stages: tuple[str, ...] = ("PAPER", "VALIDATION"), session: str | None = None) -> dict:
-        m = self.returns_matrix(hypothesis_id, stages, session)
+    def pbo(self, hypothesis_id: str | None, n_splits: int = 8, stages: tuple[str, ...] = COUNTED_STAGES, session: str | None = None, trials: list[dict] | None = None) -> dict:
+        m = self.returns_matrix(hypothesis_id, stages, session, trials)
         if m.shape[1] < 2 or len(m) < n_splits * 4:
             return {"pbo": float("nan"), "n_trials": m.shape[1], "note": "needs at least two trials on common dates"}
         out = probability_of_backtest_overfitting(m.to_numpy(), n_splits=n_splits)
@@ -203,4 +282,4 @@ class TrialLedger:
         return hypothesis_id in self.registry.holdout_viewed
 
 
-__all__ = ["STAGES", "Trial", "TrialLedger"]
+__all__ = ["COUNTED_STAGES", "STAGES", "LedgerError", "Trial", "TrialLedger"]

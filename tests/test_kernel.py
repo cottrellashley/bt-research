@@ -428,7 +428,9 @@ def test_promote_through_the_gates(src, tmp_path):
     r = sess.run(st)
     rec = sess.promote(r, "EXPLORATORY")
     assert rec.level == "EXPLORATORY" and rec.spec_hash == st.fingerprint
-    cand = sess.promote(r, "CANDIDATE")
+    with pytest.raises(GateFailure, match="dsr_threshold"):     # DSR ~0.8 on two years: below the default 0.95
+        sess.promote(r, "CANDIDATE")
+    cand = sess.promote(r, "CANDIDATE", min_dsr=0.5)
     assert cand.level == "CANDIDATE" and cand.n_trials == 1
     legacy = sess.run(st.under("MRI_v1"))                      # an unconfirmed legacy profile cannot be a candidate
     with pytest.raises(GateFailure, match="conventions_confirmed"):

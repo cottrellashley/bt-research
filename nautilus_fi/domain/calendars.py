@@ -89,18 +89,23 @@ class WeekStart(RebalanceCalendar):
 @dataclass(frozen=True)
 class Weekly(RebalanceCalendar):
     """The last trading day on or before ``weekday`` in each week (``W-WED``: Wednesday, or Tuesday
-    when Wednesday is a holiday)."""
+    when Wednesday is a holiday); ``every=2``: every other such week (``2W-WED``, biweekly)."""
 
     weekday: int = 2
     name: str = "W-WED"
+    every: int = 1
 
     def is_due(self, d, last, prev_td, next_td, elapsed=None) -> bool:
         if d.weekday() > self.weekday:
             return False
         if next_td is None:
-            return d.weekday() == self.weekday
-        same_week = next_td.isocalendar()[:2] == d.isocalendar()[:2]
-        return not same_week or next_td.weekday() > self.weekday
+            due = d.weekday() == self.weekday
+        else:
+            same_week = next_td.isocalendar()[:2] == d.isocalendar()[:2]
+            due = not same_week or next_td.weekday() > self.weekday
+        if due and self.every > 1 and last is not None:
+            due = (d.toordinal() - d.weekday()) - (last.toordinal() - last.weekday()) >= 7 * self.every
+        return due
 
 
 @dataclass(frozen=True)
@@ -145,12 +150,117 @@ class QuarterEnd(RebalanceCalendar):
 
 
 @dataclass(frozen=True)
+class YearStart(RebalanceCalendar):
+    """First trading day of the year (``BYS``)."""
+
+    name: str = "BYS"
+
+    def is_due(self, d, last, prev_td, next_td, elapsed=None) -> bool:
+        if last is not None:
+            return d.year != last.year
+        return prev_td is None or prev_td.year != d.year
+
+
+@dataclass(frozen=True)
+class YearEnd(RebalanceCalendar):
+    """Last trading day of the year (``BYE``; pandas ``Y`` / ``A``)."""
+
+    name: str = "BYE"
+
+    def is_due(self, d, last, prev_td, next_td, elapsed=None) -> bool:
+        return next_td is None or next_td.year != d.year
+
+
+@dataclass(frozen=True)
+class NthBusinessDay(RebalanceCalendar):
+    """The ``n``-th trading day of each month (``n=2``: the second; ``n=-1``: the last), on the
+    trading days given (holidays already out)."""
+
+    n: int = 2
+    name: str = "NTH_BD"
+
+    def dates(self, trading_days: Sequence[date], first_decision: bool = False) -> list[date]:
+        by_month: dict[tuple, list[date]] = {}
+        for d in trading_days:
+            by_month.setdefault((d.year, d.month), []).append(d)
+        out = []
+        for days in by_month.values():
+            k = self.n - 1 if self.n > 0 else self.n
+            if -len(days) <= k < len(days):
+                out.append(days[k])
+        if first_decision and trading_days and (not out or out[0] != trading_days[0]):
+            out = [trading_days[0], *out]
+        return sorted(set(out))
+
+    def is_due(self, d, last, prev_td, next_td, elapsed=None) -> bool:
+        raise NotImplementedError("NthBusinessDay decides from the month's trading days: use dates()")
+
+
+@dataclass(frozen=True)
+class AnchoredWeekly(RebalanceCalendar):
+    """Anchor dates (the benchmark's month ends by default, or ``anchors``) plus rebalances
+    ``offsets`` calendar days after each (7 / 14 / 21), rolled forward over holidays; an offset date
+    with fewer than ``min_gap_days`` before the next anchor is skipped (Erin Beta+'s weekly rule)."""
+
+    offsets: tuple[int, ...] = (7, 14, 21)
+    min_gap_days: int = 7
+    anchors: tuple[date, ...] = ()
+    name: str = "ANCHORED_WEEKLY"
+
+    def dates(self, trading_days: Sequence[date], first_decision: bool = False) -> list[date]:
+        days = list(trading_days)
+        if not days:
+            return []
+        anchors = sorted(set(self.anchors)) if self.anchors else MonthEnd().dates(days)
+        snapped = [days[min(bisect_left(days, a), len(days) - 1)] for a in anchors]
+        out = {a for a in snapped if days[0] <= a <= days[-1]}
+        for i, a in enumerate(snapped):
+            nxt = snapped[i + 1] if i + 1 < len(snapped) else None
+            for off in self.offsets:
+                target = date.fromordinal(a.toordinal() + off)
+                j = bisect_left(days, target)                 # holidays roll forward
+                if j >= len(days):
+                    continue
+                d = days[j]
+                if nxt is not None and (d >= nxt or (nxt - d).days < self.min_gap_days):
+                    continue
+                out.add(d)
+        if first_decision:
+            out.add(days[0])
+        return sorted(out)
+
+    def is_due(self, d, last, prev_td, next_td, elapsed=None) -> bool:
+        raise NotImplementedError("AnchoredWeekly decides from the anchors: use dates()")
+
+
+@dataclass(frozen=True)
+class IndexDates(RebalanceCalendar):
+    """The reconstitution dates of an index, read from the source's constituents when the run is
+    prepared (``align`` as for ``Explicit``: providers publish reconstitutions ahead)."""
+
+    index: str = ""
+    align: str = "on_or_before"
+    name: str = "INDEX_DATES"
+
+    def resolve(self, source) -> Explicit:
+        import pandas as pd
+
+        c = source.constituents(self.index)
+        ds = sorted({pd.Timestamp(x).date() for x in pd.to_datetime(c["date"])})
+        return Explicit(tuple(ds), self.align, f"INDEX:{self.index}")
+
+    def is_due(self, d, last, prev_td, next_td, elapsed=None) -> bool:
+        raise NotImplementedError(f"IndexDates({self.index!r}) is resolved from the source when the run is prepared")
+
+
+@dataclass(frozen=True)
 class Explicit(RebalanceCalendar):
-    """Explicit target dates aligned to trading days: a target on a holiday moves to the previous
-    trading day (``align="on_or_before"``) or the next one (``"on_or_after"``)."""
+    """Explicit target dates aligned to trading days: a target on a holiday moves to the next
+    trading day (``align="on_or_after"``, the default: an instruction cannot act before it exists)
+    or the previous one (``"on_or_before"``, for dates published ahead, like index reconstitutions)."""
 
     targets: tuple[date, ...] = ()
-    align: str = "on_or_before"
+    align: str = "on_or_after"
     name: str = "EXPLICIT"
 
     def is_due(self, d, last, prev_td, next_td, elapsed=None) -> bool:
@@ -173,21 +283,57 @@ def IndexCalendar(name: str, dates: Iterable[date], align: str = "on_or_before")
 @dataclass(frozen=True)
 class Triggered(RebalanceCalendar):
     """Evaluated on every ``base`` date; the engine computes the proposed target and rebalances only
-    when ``measure`` exceeds ``threshold``: ``"turnover"`` (one-way, of NAV) or ``"signal"`` (mean
-    absolute change in cross-sectional percentile rank of ``field`` since the last rebalance)."""
+    when ``measure`` reaches ``threshold``: ``"turnover"`` (of NAV, under ``turnover``: half the sum
+    of absolute weight changes by default) or ``"signal"`` (mean absolute change in cross-sectional
+    percentile rank since the last rebalance, of ``field`` when given, else the strategy's signal)."""
 
     threshold: float = 0.05
-    measure: str = "turnover"
+    measure: str = "turnover"                    # turnover | signal | score_drop (portfolio-weighted score fallen by threshold since the last rebalance)
     field: str | None = None
+    turnover: str = "HALF_SUM"                   # ONE_WAY_BUYS | HALF_SUM | TWO_WAY
     base: RebalanceCalendar = dataclasses.field(default_factory=Daily)
     name: str = "TRIGGERED"
     triggered: bool = True
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.base, RebalanceCalendar):                # "BME", "WS" ...: the named calendar
+            object.__setattr__(self, "base", parse_calendar(self.base))
+
     def is_due(self, d, last, prev_td, next_td, elapsed=None) -> bool:
         return self.base.is_due(d, last, prev_td, next_td, elapsed)
 
+    def dates(self, trading_days: Sequence[date], first_decision: bool = False) -> list[date]:
+        return self.base.dates(trading_days, first_decision)
 
-_FIXED = {"D": Daily, "W": WeekStart, "M": MonthStart, "BMS": MonthStart, "MS": MonthStart, "BME": MonthEnd, "ME": MonthEnd, "Q": QuarterStart, "BQS": QuarterStart, "QS": QuarterStart, "BQE": QuarterEnd, "QE": QuarterEnd}
+
+@dataclass(frozen=True)
+class WithInterim(RebalanceCalendar):
+    """A fixed calendar plus interim rebalances between its dates: on every ``interim`` base day
+    the engine checks the ``interim`` trigger and rebalances with ``portfolio`` (default: the
+    strategy's) when it fires. ``fixed`` dates always rebalance with the strategy's construction."""
+
+    fixed: RebalanceCalendar = dataclasses.field(default_factory=MonthEnd)
+    interim: Triggered = dataclasses.field(default_factory=lambda: Triggered(0.1, "score_drop"))
+    portfolio: object = None
+    name: str = "WITH_INTERIM"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fixed, RebalanceCalendar):
+            object.__setattr__(self, "fixed", parse_calendar(self.fixed))
+
+    def dates(self, trading_days: Sequence[date], first_decision: bool = False) -> list[date]:
+        return sorted(set(self.fixed.dates(trading_days, first_decision)) | set(self.interim.dates(trading_days, False)))
+
+    def fixed_dates(self, trading_days: Sequence[date], first_decision: bool = False) -> set[date]:
+        return set(self.fixed.dates(trading_days, first_decision))
+
+    def is_due(self, d, last, prev_td, next_td, elapsed=None) -> bool:
+        return self.fixed.is_due(d, last, prev_td, next_td, elapsed) or self.interim.is_due(d, last, prev_td, next_td, elapsed)
+
+
+_FIXED = {"D": Daily, "W": WeekStart, "WS": WeekStart, "M": MonthStart, "BMS": MonthStart, "MS": MonthStart, "BME": MonthEnd, "ME": MonthEnd, "Q": QuarterStart, "BQS": QuarterStart, "QS": QuarterStart, "BQE": QuarterEnd, "QE": QuarterEnd,
+          "Y": YearEnd, "A": YearEnd, "YE": YearEnd, "BYE": YearEnd, "BA": YearEnd, "YS": YearStart, "BYS": YearStart, "AS": YearStart}
+_LEGACY = {"M": "BMS", "W": "WS", "Q": "BQS"}           # period starts here, period ends in pandas: say which
 
 
 def parse_calendar(spec: str | int | RebalanceCalendar) -> RebalanceCalendar:
@@ -196,25 +342,37 @@ def parse_calendar(spec: str | int | RebalanceCalendar) -> RebalanceCalendar:
     if isinstance(spec, int) or str(spec).isdigit():
         return EveryN(int(spec), name=str(int(spec)))
     s = str(spec).upper()
+    if s in _LEGACY:
+        import warnings
+
+        warnings.warn(f"rebalance calendar {spec!r} means the first trading day of the period here and the period end in pandas: write {_LEGACY[s]!r} (or the end: {_LEGACY[s].replace('S', 'E') if s != 'W' else 'W-FRI'!r})", FutureWarning, stacklevel=2)
     if s in _FIXED:
         return _FIXED[s]()
     if s.startswith("W-") and s[2:] in WEEKDAYS:
         return Weekly(WEEKDAYS[s[2:]], name=s)
-    raise ValueError(f"unknown rebalance calendar {spec!r}; use D, N, W, W-<DAY>, M/BMS, BME, Q/BQS, BQE or a RebalanceCalendar")
+    if s.startswith("2W-") and s[3:] in WEEKDAYS:
+        return Weekly(WEEKDAYS[s[3:]], name=s, every=2)
+    raise ValueError(f"unknown rebalance calendar {spec!r}; use D, N, WS, W-<DAY>, 2W-<DAY>, BMS, BME, BQS, BQE, BYS, BYE or a RebalanceCalendar")
 
 
 __all__ = [
+    "AnchoredWeekly",
     "Daily",
     "EveryN",
     "Explicit",
     "IndexCalendar",
+    "IndexDates",
     "MonthEnd",
     "MonthStart",
+    "NthBusinessDay",
     "QuarterEnd",
     "QuarterStart",
     "RebalanceCalendar",
     "Triggered",
     "WeekStart",
     "Weekly",
+    "WithInterim",
+    "YearEnd",
+    "YearStart",
     "parse_calendar",
 ]
